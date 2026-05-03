@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableSdkContainerSupport>true</EnableSdkContainerSupport>
+    <ContainerBaseImage>mcr.microsoft.com/dotnet/aspnet:9.0-noble</ContainerBaseImage>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\EventHubHost.ServiceDefaults\EventHubHost.ServiceDefaults.csproj" />
+  </ItemGroup>
+
+</Project>
