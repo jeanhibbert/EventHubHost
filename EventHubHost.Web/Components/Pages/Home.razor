@@ -1,7 +1,11 @@
 ﻿@page "/"
 @rendermode InteractiveServer
+@implements IAsyncDisposable
+@using Microsoft.AspNetCore.SignalR.Client
+@using Microsoft.Extensions.Options
 
 @inject CorrelationApiClient CorrelationApi
+@inject IOptions<CorrelationApiOptions> CorrelationApiOptions
 
 <PageTitle>Home</PageTitle>
 
@@ -48,8 +52,8 @@ else
 		</div>
 		<div class="col-sm-6 col-xl-3">
 			<div class="metric-panel">
-				<span>Matched keys</span>
-				<strong>@status.MatchedCorrelationKeys</strong>
+				<span>Temporal matches</span>
+				<strong>@status.TemporalMatches</strong>
 			</div>
 		</div>
 	</div>
@@ -57,12 +61,13 @@ else
 	<section class="mb-4">
 		<div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
 			<h2 class="h5 mb-0">Ask the LLM</h2>
-			<span class="badge @(status.VectorStoreAvailable ? "text-bg-success" : "text-bg-warning")">
-				Vector DB @(status.VectorStoreAvailable ? "online" : "fallback")
+			<span class="badge @(status.SqlStoreAvailable ? "text-bg-success" : "text-bg-warning")">
+				SQL dataset @(status.SqlStoreAvailable ? "online" : "offline")
 			</span>
 		</div>
+		<p class="text-secondary small mb-2">Matching window: @status.TemporalWindowSeconds seconds after a System A type 2 event.</p>
 		<textarea class="form-control mb-2" rows="3" @bind="question"></textarea>
-		<button class="btn btn-primary" @onclick="AskAsync" disabled="@busy || string.IsNullOrWhiteSpace(question)">Ask</button>
+		<button class="btn btn-primary" @onclick="AskAsync" disabled="@(busy || string.IsNullOrWhiteSpace(question))">Ask</button>
 	</section>
 
 	@if (insight is not null)
@@ -88,7 +93,6 @@ else
 						<th>System</th>
 						<th>Type</th>
 						<th>Event</th>
-						<th>Correlation key</th>
 					</tr>
 				</thead>
 				<tbody>
@@ -99,7 +103,6 @@ else
 							<td>@eventItem.SourceSystem</td>
 							<td>@eventItem.EventType</td>
 							<td>@eventItem.Name</td>
-							<td><code>@eventItem.CorrelationKey</code></td>
 						</tr>
 					}
 				</tbody>
@@ -111,13 +114,30 @@ else
 @code {
 	private CorrelationStatus? status;
 	private CorrelationQueryResponse? insight;
-	private string question = "Has System A event type 2 caused a unique event in System B?";
+	private string question = "Does the SQL event history show that System B unique events tend to happen shortly after System A type 2 events?";
 	private string? error;
 	private bool busy;
+	private HubConnection? hubConnection;
 
 	protected override async Task OnInitializedAsync()
 	{
 		await RefreshAsync();
+		await ConnectEventStreamAsync();
+	}
+
+	private async Task ConnectEventStreamAsync()
+	{
+		hubConnection = new HubConnectionBuilder()
+			.WithUrl(CorrelationApiOptions.Value.EventHubUrl)
+			.WithAutomaticReconnect()
+			.Build();
+
+		hubConnection.On<CorrelationEvent>("EventIngested", async _ =>
+		{
+			await InvokeAsync(async () => await RefreshAsync());
+		});
+
+		await hubConnection.StartAsync();
 	}
 
 	private async Task RefreshAsync()
@@ -158,6 +178,14 @@ else
 		finally
 		{
 			busy = false;
+		}
+	}
+
+	public async ValueTask DisposeAsync()
+	{
+		if (hubConnection is not null)
+		{
+			await hubConnection.DisposeAsync();
 		}
 	}
 }

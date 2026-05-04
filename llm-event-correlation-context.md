@@ -18,8 +18,9 @@ This is an **event-driven architecture** with the LLM acting as an intelligent p
 - Decouple event ingestion from LLM analysis
 - LLM is a **reasoning layer** over windowed, normalised event batches
 - Persist raw and enriched events for replay, audit, and future fine-tuning
-- Use RAG (Retrieval-Augmented Generation) over a vector store of historical events to improve correlation quality
+- Use SQL Server as the persisted event dataset for temporal queries, audit, replay, and LLM prompt context
 - Use traditional rule-based pre-filters to gate LLM invocation (cost/latency control)
+- Keep independent source systems honest by inferring correlations from time windows and event patterns, not shared correlation keys
 
 ---
 
@@ -28,26 +29,24 @@ This is an **event-driven architecture** with the LLM acting as an intelligent p
 ```
 System A ──────────┐
                    ▼
-              [Message Broker / Kafka / Event Hubs]
+              [Message Broker / NServiceBus / Event Hubs]
                    │
 System B ──────────┘
                    │
                    ▼
-         [Stream Processor / Flink / Stream Analytics]
+         [Stream Processor / Stream Analytics]
          (normalise, deduplicate, window, pre-filter)
                    │
-          ┌────────┴────────┐
-          ▼                 ▼
-    [Time-Series DB]   [Vector DB]
-    (raw storage)      (embeddings + RAG)
-          │                 │
-          └────────┬────────┘
+                   ▼
+          [SQL Server Event Dataset]
+          (raw events + temporal summaries)
+                   │
                    ▼
           [LLM Correlation Engine]
-          (windowed prompt + RAG context injection)
+          (windowed prompt + SQL-derived context)
                    │
                    ▼
     ┌──────────────┼──────────────┐
     ▼              ▼              ▼
-[Alerts]     [Dashboard]      [API / DB]
+[Alerts]     [Blazor Web Dashboard]     [API / DB]
 ```

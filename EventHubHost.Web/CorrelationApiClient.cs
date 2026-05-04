@@ -27,8 +27,7 @@ public sealed record CorrelationEvent(
     int EventType,
     string Name,
     string Description,
-    DateTimeOffset OccurredAt,
-    string CorrelationKey);
+    DateTimeOffset OccurredAt);
 
 public sealed record CorrelationQueryRequest(string Question);
 
@@ -43,6 +42,12 @@ public sealed record CorrelationStatus(
     int SystemBEvents,
     int SystemAType2Events,
     int SystemBUniqueEvents,
-    int MatchedCorrelationKeys,
-    bool VectorStoreAvailable,
+    int TemporalMatches,
+    int TemporalWindowSeconds,
+    bool SqlStoreAvailable,
     IReadOnlyList<CorrelationEvent> RecentEvents);
+
+public sealed class CorrelationApiOptions
+{
+    public string EventHubUrl { get; set; } = "http://localhost:5562/hubs/events";
+}

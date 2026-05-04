@@ -1,8 +1,10 @@
 using System.Net;
 using System.Net.Http.Json;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
+using EventHubHost.ApiService.Data;
+using EventHubHost.ApiService.Hubs;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
 namespace EventHubHost.ApiService;
@@ -13,8 +15,7 @@ public sealed record CorrelationEvent(
     int EventType,
     string Name,
     string Description,
-    DateTimeOffset OccurredAt,
-    string CorrelationKey);
+    DateTimeOffset OccurredAt);
 
 public sealed record CorrelationQueryRequest(string Question);
 
@@ -29,15 +30,10 @@ public sealed record CorrelationStatus(
     int SystemBEvents,
     int SystemAType2Events,
     int SystemBUniqueEvents,
-    int MatchedCorrelationKeys,
-    bool VectorStoreAvailable,
+    int TemporalMatches,
+    int TemporalWindowSeconds,
+    bool SqlStoreAvailable,
     IReadOnlyList<CorrelationEvent> RecentEvents);
-
-public sealed class QdrantOptions
-{
-    public string Endpoint { get; set; } = "http://localhost:6333";
-    public string Collection { get; set; } = "events";
-}
 
 public sealed class OllamaOptions
 {
@@ -46,27 +42,28 @@ public sealed class OllamaOptions
     public bool AutoPullModel { get; set; } = true;
 }
 
+public sealed class CorrelationOptions
+{
+    public int TemporalWindowSeconds { get; set; } = 15;
+}
+
 public static class CorrelationEventFactory
 {
     public const int SystemATypeThatCausesSystemB = 2;
     public const int SystemBUniqueEventType = 9002;
 
-    public static CorrelationEvent CreateSystemAEvent(int eventType, string? correlationKey = null)
-    {
-        var key = correlationKey ?? $"A-{Guid.NewGuid():N}";
-        return new CorrelationEvent(
+    public static CorrelationEvent CreateSystemAEvent(int eventType, DateTimeOffset? occurredAt = null) =>
+        new(
             Guid.NewGuid(),
             "System A",
             eventType,
             $"System A type {eventType}",
             eventType == SystemATypeThatCausesSystemB
-                ? "System A emitted the enforced type 2 event."
+                ? "System A emitted an independent type 2 event."
                 : "System A emitted a random business event.",
-            DateTimeOffset.UtcNow,
-            key);
-    }
+            occurredAt ?? DateTimeOffset.UtcNow);
 
-    public static CorrelationEvent CreateSystemBEvent(int eventType, string? correlationKey = null)
+    public static CorrelationEvent CreateSystemBEvent(int eventType, DateTimeOffset? occurredAt = null)
     {
         var unique = eventType == SystemBUniqueEventType;
         return new CorrelationEvent(
@@ -75,19 +72,18 @@ public static class CorrelationEventFactory
             eventType,
             unique ? "System B unique response" : $"System B type {eventType}",
             unique
-                ? "System B emitted the unique event that only follows a System A type 2 event."
+                ? "System B emitted a unique event that may be temporally related to recent System A activity."
                 : "System B emitted a random business event.",
-            DateTimeOffset.UtcNow,
-            correlationKey ?? $"B-{Guid.NewGuid():N}");
+            occurredAt ?? DateTimeOffset.UtcNow);
     }
 
     public static IReadOnlyList<CorrelationEvent> CreateEnforcedScenario()
     {
-        var key = $"scenario-{Guid.NewGuid():N}";
+        var scenarioStart = DateTimeOffset.UtcNow;
         return
         [
-            CreateSystemAEvent(SystemATypeThatCausesSystemB, key),
-            CreateSystemBEvent(SystemBUniqueEventType, key)
+            CreateSystemAEvent(SystemATypeThatCausesSystemB, scenarioStart),
+            CreateSystemBEvent(SystemBUniqueEventType, scenarioStart.AddSeconds(2))
         ];
     }
 }
@@ -103,19 +99,20 @@ public sealed class EventSimulationWorker(EventRepository repository, ILogger<Ev
             try
             {
                 var type = Random.Shared.Next(1, 5);
-                var systemAEvent = CorrelationEventFactory.CreateSystemAEvent(type);
-                await repository.AddAsync(systemAEvent, stoppingToken);
+                var occurredAt = DateTimeOffset.UtcNow;
+                await repository.AddAsync(CorrelationEventFactory.CreateSystemAEvent(type, occurredAt), stoppingToken);
 
                 if (type == CorrelationEventFactory.SystemATypeThatCausesSystemB)
                 {
+                    await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
                     await repository.AddAsync(
-                        CorrelationEventFactory.CreateSystemBEvent(CorrelationEventFactory.SystemBUniqueEventType, systemAEvent.CorrelationKey),
+                        CorrelationEventFactory.CreateSystemBEvent(CorrelationEventFactory.SystemBUniqueEventType, occurredAt.AddSeconds(1)),
                         stoppingToken);
                 }
                 else if (Random.Shared.NextDouble() > 0.35)
                 {
                     await repository.AddAsync(
-                        CorrelationEventFactory.CreateSystemBEvent(Random.Shared.Next(1, 5)),
+                        CorrelationEventFactory.CreateSystemBEvent(Random.Shared.Next(1, 5), DateTimeOffset.UtcNow),
                         stoppingToken);
                 }
             }
@@ -131,288 +128,113 @@ public sealed class EventSimulationWorker(EventRepository repository, ILogger<Ev
     }
 }
 
-public sealed class EventRepository(QdrantEventVectorStore vectorStore, ILogger<EventRepository> logger)
+public sealed class EventRepository(
+    IDbContextFactory<CorrelationDbContext> dbContextFactory,
+    IHubContext<EventIngestionHub> hubContext,
+    IOptions<CorrelationOptions> options,
+    ILogger<EventRepository> logger)
 {
-    private readonly List<CorrelationEvent> events = [];
-    private readonly Lock gate = new();
-
     public async Task AddAsync(CorrelationEvent eventItem, CancellationToken cancellationToken)
     {
-        lock (gate)
-        {
-            events.Add(eventItem);
-            if (events.Count > 500)
-            {
-                events.RemoveRange(0, events.Count - 500);
-            }
-        }
-
         try
         {
-            await vectorStore.UpsertAsync(eventItem, cancellationToken);
+            await using var dbContext = await dbContextFactory.CreateDbContextAsync(cancellationToken);
+            dbContext.Events.Add(ToEntity(eventItem));
+            await dbContext.SaveChangesAsync(cancellationToken);
+            await hubContext.Clients.All.SendAsync("EventIngested", eventItem, cancellationToken);
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Vector store write failed; event remains available in memory.");
+            logger.LogWarning(ex, "SQL event persistence failed.");
+            throw;
         }
     }
 
     public async Task<IReadOnlyList<CorrelationEvent>> GetRecentAsync(int take, CancellationToken cancellationToken)
     {
-        try
-        {
-            var storedEvents = await vectorStore.GetRecentAsync(take, cancellationToken);
-            if (storedEvents.Count > 0)
-            {
-                return storedEvents;
-            }
-        }
-        catch (Exception ex)
-        {
-            logger.LogDebug(ex, "Vector store read failed; using in-memory events.");
-        }
+        await using var dbContext = await dbContextFactory.CreateDbContextAsync(cancellationToken);
+        var events = await dbContext.Events
+            .AsNoTracking()
+            .OrderByDescending(eventItem => eventItem.OccurredAt)
+            .Take(take)
+            .ToArrayAsync(cancellationToken);
 
-        lock (gate)
-        {
-            return events
-                .OrderByDescending(eventItem => eventItem.OccurredAt)
-                .Take(take)
-                .ToArray();
-        }
+        return events.Select(ToModel).ToArray();
     }
 
     public async Task<CorrelationStatus> GetStatusAsync(CancellationToken cancellationToken)
     {
-        var recentEvents = await GetRecentAsync(100, cancellationToken);
-        var systemAType2Keys = recentEvents
-            .Where(eventItem => eventItem.SourceSystem == "System A" && eventItem.EventType == CorrelationEventFactory.SystemATypeThatCausesSystemB)
-            .Select(eventItem => eventItem.CorrelationKey)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var systemBUniqueKeys = recentEvents
-            .Where(eventItem => eventItem.SourceSystem == "System B" && eventItem.EventType == CorrelationEventFactory.SystemBUniqueEventType)
-            .Select(eventItem => eventItem.CorrelationKey)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        return new CorrelationStatus(
-            recentEvents.Count,
-            recentEvents.Count(eventItem => eventItem.SourceSystem == "System A"),
-            recentEvents.Count(eventItem => eventItem.SourceSystem == "System B"),
-            systemAType2Keys.Count,
-            systemBUniqueKeys.Count,
-            systemAType2Keys.Intersect(systemBUniqueKeys, StringComparer.OrdinalIgnoreCase).Count(),
-            await vectorStore.IsAvailableAsync(cancellationToken),
-            recentEvents.Take(20).ToArray());
-    }
-}
-
-public sealed class QdrantEventVectorStore(HttpClient httpClient, IOptions<QdrantOptions> options)
-{
-    private const int VectorSize = 16;
-    private readonly SemaphoreSlim initializationLock = new(1, 1);
-    private bool initialized;
-
-    public async Task UpsertAsync(CorrelationEvent eventItem, CancellationToken cancellationToken)
-    {
-        ConfigureClient();
-        await EnsureCollectionAsync(cancellationToken);
-
-        var payload = new
+        try
         {
-            points = new[]
-            {
-                new
-                {
-                    id = eventItem.Id,
-                    vector = CreateEmbedding(eventItem),
-                    payload = new
-                    {
-                        eventItem.SourceSystem,
-                        eventItem.EventType,
-                        eventItem.Name,
-                        eventItem.Description,
-                        OccurredAt = eventItem.OccurredAt,
-                        eventItem.CorrelationKey
-                    }
-                }
-            }
+            await using var dbContext = await dbContextFactory.CreateDbContextAsync(cancellationToken);
+            var recentEntities = await dbContext.Events
+                .AsNoTracking()
+                .OrderByDescending(eventItem => eventItem.OccurredAt)
+                .Take(250)
+                .ToArrayAsync(cancellationToken);
+            var recentEvents = recentEntities.Select(ToModel).ToArray();
+            var temporalMatches = CountTemporalMatches(recentEvents, options.Value.TemporalWindowSeconds);
+
+            return new CorrelationStatus(
+                await dbContext.Events.CountAsync(cancellationToken),
+                await dbContext.Events.CountAsync(eventItem => eventItem.SourceSystem == "System A", cancellationToken),
+                await dbContext.Events.CountAsync(eventItem => eventItem.SourceSystem == "System B", cancellationToken),
+                await dbContext.Events.CountAsync(eventItem => eventItem.SourceSystem == "System A" && eventItem.EventType == CorrelationEventFactory.SystemATypeThatCausesSystemB, cancellationToken),
+                await dbContext.Events.CountAsync(eventItem => eventItem.SourceSystem == "System B" && eventItem.EventType == CorrelationEventFactory.SystemBUniqueEventType, cancellationToken),
+                temporalMatches,
+                options.Value.TemporalWindowSeconds,
+                true,
+                recentEvents.Take(20).ToArray());
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "SQL status query failed.");
+            return new CorrelationStatus(0, 0, 0, 0, 0, 0, options.Value.TemporalWindowSeconds, false, []);
+        }
+    }
+
+    public static int CountTemporalMatches(IReadOnlyList<CorrelationEvent> events, int temporalWindowSeconds)
+    {
+        var orderedEvents = events.OrderBy(eventItem => eventItem.OccurredAt).ToArray();
+        var window = TimeSpan.FromSeconds(temporalWindowSeconds);
+
+        return orderedEvents.Count(systemAEvent =>
+            systemAEvent.SourceSystem == "System A"
+            && systemAEvent.EventType == CorrelationEventFactory.SystemATypeThatCausesSystemB
+            && orderedEvents.Any(systemBEvent =>
+                systemBEvent.SourceSystem == "System B"
+                && systemBEvent.EventType == CorrelationEventFactory.SystemBUniqueEventType
+                && systemBEvent.OccurredAt >= systemAEvent.OccurredAt
+                && systemBEvent.OccurredAt - systemAEvent.OccurredAt <= window));
+    }
+
+    private static CorrelationEventEntity ToEntity(CorrelationEvent eventItem) =>
+        new()
+        {
+            Id = eventItem.Id,
+            SourceSystem = eventItem.SourceSystem,
+            EventType = eventItem.EventType,
+            Name = eventItem.Name,
+            Description = eventItem.Description,
+            OccurredAt = eventItem.OccurredAt
         };
 
-        var response = await httpClient.PutAsJsonAsync($"/collections/{options.Value.Collection}/points?wait=true", payload, cancellationToken);
-        response.EnsureSuccessStatusCode();
-    }
-
-    public async Task<IReadOnlyList<CorrelationEvent>> GetRecentAsync(int take, CancellationToken cancellationToken)
-    {
-        ConfigureClient();
-        await EnsureCollectionAsync(cancellationToken);
-
-        var response = await httpClient.PostAsJsonAsync($"/collections/{options.Value.Collection}/points/scroll", new
-        {
-            limit = take,
-            with_payload = true,
-            with_vector = false
-        }, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-        if (!document.RootElement.TryGetProperty("result", out var result)
-            || !result.TryGetProperty("points", out var points))
-        {
-            return [];
-        }
-
-        return points.EnumerateArray()
-            .Select(TryReadEvent)
-            .OfType<CorrelationEvent>()
-            .OrderByDescending(eventItem => eventItem.OccurredAt)
-            .Take(take)
-            .ToArray();
-    }
-
-    public async Task<bool> IsAvailableAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            ConfigureClient();
-            var response = await httpClient.GetAsync("/collections", cancellationToken);
-            return response.IsSuccessStatusCode;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private async Task EnsureCollectionAsync(CancellationToken cancellationToken)
-    {
-        if (initialized)
-        {
-            return;
-        }
-
-        await initializationLock.WaitAsync(cancellationToken);
-        try
-        {
-            if (initialized)
-            {
-                return;
-            }
-
-            var getResponse = await httpClient.GetAsync($"/collections/{options.Value.Collection}", cancellationToken);
-            if (getResponse.IsSuccessStatusCode)
-            {
-                initialized = true;
-                return;
-            }
-
-            var createResponse = await httpClient.PutAsJsonAsync($"/collections/{options.Value.Collection}", new
-            {
-                vectors = new
-                {
-                    size = VectorSize,
-                    distance = "Cosine"
-                }
-            }, cancellationToken);
-
-            createResponse.EnsureSuccessStatusCode();
-            initialized = true;
-        }
-        finally
-        {
-            initializationLock.Release();
-        }
-    }
-
-    private void ConfigureClient()
-    {
-        if (httpClient.BaseAddress is not null)
-        {
-            return;
-        }
-
-        httpClient.BaseAddress = new Uri(options.Value.Endpoint.TrimEnd('/'));
-    }
-
-    private static CorrelationEvent? TryReadEvent(JsonElement point)
-    {
-        try
-        {
-            var payload = point.GetProperty("payload");
-            return new CorrelationEvent(
-                point.GetProperty("id").GetGuid(),
-                GetString(payload, "sourceSystem", "SourceSystem") ?? "Unknown",
-                GetInt32(payload, "eventType", "EventType"),
-                GetString(payload, "name", "Name") ?? "Unknown event",
-                GetString(payload, "description", "Description") ?? string.Empty,
-                GetDateTimeOffset(payload, "occurredAt", "OccurredAt"),
-                GetString(payload, "correlationKey", "CorrelationKey") ?? string.Empty);
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private static string? GetString(JsonElement payload, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (payload.TryGetProperty(name, out var value))
-            {
-                return value.GetString();
-            }
-        }
-
-        return null;
-    }
-
-    private static int GetInt32(JsonElement payload, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (payload.TryGetProperty(name, out var value))
-            {
-                return value.GetInt32();
-            }
-        }
-
-        return 0;
-    }
-
-    private static DateTimeOffset GetDateTimeOffset(JsonElement payload, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (payload.TryGetProperty(name, out var value))
-            {
-                return value.GetDateTimeOffset();
-            }
-        }
-
-        return DateTimeOffset.MinValue;
-    }
-
-    private static double[] CreateEmbedding(CorrelationEvent eventItem)
-    {
-        var vector = new double[VectorSize];
-        var text = $"{eventItem.SourceSystem}|{eventItem.EventType}|{eventItem.Name}|{eventItem.Description}|{eventItem.CorrelationKey}";
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(text));
-
-        for (var index = 0; index < VectorSize; index++)
-        {
-            vector[index] = (hash[index] / 255d * 2d) - 1d;
-        }
-
-        vector[0] = eventItem.SourceSystem == "System A" ? 1d : -1d;
-        vector[1] = eventItem.EventType / 10000d;
-        vector[2] = eventItem.EventType == CorrelationEventFactory.SystemBUniqueEventType ? 1d : 0d;
-        return vector;
-    }
+    private static CorrelationEvent ToModel(CorrelationEventEntity eventItem) =>
+        new(
+            eventItem.Id,
+            eventItem.SourceSystem,
+            eventItem.EventType,
+            eventItem.Name,
+            eventItem.Description,
+            eventItem.OccurredAt);
 }
 
-public sealed class OllamaCorrelationClient(HttpClient httpClient, IOptions<OllamaOptions> options, ILogger<OllamaCorrelationClient> logger)
+public sealed class OllamaCorrelationClient(IOptions<OllamaOptions> options, ILogger<OllamaCorrelationClient> logger) : IDisposable
 {
+    private readonly HttpClient httpClient = new()
+    {
+        Timeout = TimeSpan.FromMinutes(10)
+    };
     private readonly SemaphoreSlim modelPullLock = new(1, 1);
 
     public async Task<CorrelationQueryResponse> AskAsync(
@@ -429,6 +251,17 @@ public sealed class OllamaCorrelationClient(HttpClient httpClient, IOptions<Olla
             try
             {
                 var answer = await GenerateAsync(prompt, allowModelPull: true, cancellationToken);
+                if (!IsGroundedAnswer(answer, status))
+                {
+                    var correctivePrompt = CreateCorrectivePrompt(prompt, answer, status);
+                    answer = await GenerateAsync(correctivePrompt, allowModelPull: false, cancellationToken);
+                }
+
+                if (!IsGroundedAnswer(answer, status))
+                {
+                    answer = CreateVerifiedSqlAnswer(events, status);
+                }
+
                 return new CorrelationQueryResponse(answer, true, events.Take(30).ToArray());
             }
             catch (Exception ex) when (attempt < 3)
@@ -438,7 +271,7 @@ public sealed class OllamaCorrelationClient(HttpClient httpClient, IOptions<Olla
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Ollama generation failed; returning local correlation summary.");
+                logger.LogWarning(ex, "Ollama generation failed; returning local temporal correlation summary.");
                 return new CorrelationQueryResponse(CreateFallbackAnswer(question, status), false, events.Take(30).ToArray());
             }
         }
@@ -507,39 +340,128 @@ public sealed class OllamaCorrelationClient(HttpClient httpClient, IOptions<Olla
             httpClient.BaseAddress = new Uri(options.Value.Endpoint.TrimEnd('/'));
         }
 
-        httpClient.Timeout = TimeSpan.FromMinutes(10);
+    }
+
+    public void Dispose()
+    {
+        httpClient.Dispose();
+        modelPullLock.Dispose();
     }
 
     private static string CreatePrompt(string question, IReadOnlyList<CorrelationEvent> events, CorrelationStatus status)
     {
-        var eventLines = events.Take(40).Select(eventItem =>
-            $"- {eventItem.OccurredAt:O} | {eventItem.SourceSystem} | type {eventItem.EventType} | key {eventItem.CorrelationKey} | {eventItem.Description}");
+        var eventLines = events
+            .OrderBy(eventItem => eventItem.OccurredAt)
+            .TakeLast(80)
+            .Select(eventItem =>
+                $"- {eventItem.OccurredAt:O} | {eventItem.SourceSystem} | type {eventItem.EventType} | {eventItem.Description}");
+        var matchedPairLines = CreateMatchedPairLines(events, status.TemporalWindowSeconds);
+        var computedFinding = status.TemporalMatches > 0
+            ? $"SUPPORTED: the SQL analysis found {status.TemporalMatches} time-window match(es). A time-window match means a System A type 2 event was followed by System B type 9002 within {status.TemporalWindowSeconds} seconds."
+            : "NOT YET SUPPORTED: the SQL analysis found zero time-window matches.";
 
         return $$"""
-You are a centralized event correlation engine. Use only the supplied event context.
+You are a centralized event correlation analyst. Use only the supplied SQL event dataset context and temporal summary.
 
-Known enforced scenario for validation: when System A emits event type 2, System B emits unique event type 9002 with the same correlation key.
+The source systems are independent. There is no shared correlation ID, key, trace ID, or transaction ID. Do not claim that events are linked by identity. Reason only from event timing, event type, and observed counts.
 
-Current counts:
+Correlation hypothesis being tested:
+When System A emits event type 2, System B tends to emit its unique event type 9002 shortly afterward.
+
+Temporal summary computed from the SQL dataset:
 - Total events: {{status.TotalEvents}}
+- System A events: {{status.SystemAEvents}}
+- System B events: {{status.SystemBEvents}}
 - System A type 2 events: {{status.SystemAType2Events}}
-- System B unique events: {{status.SystemBUniqueEvents}}
-- Matched correlation keys: {{status.MatchedCorrelationKeys}}
+- System B unique type 9002 events: {{status.SystemBUniqueEvents}}
+- Time-window matches: {{status.TemporalMatches}} System A type 2 event(s) were followed by a System B type 9002 event within {{status.TemporalWindowSeconds}} seconds.
 
-Recent event context:
+Deterministic SQL-computed finding:
+{{computedFinding}}
+
+Exact matched event examples computed from the SQL event rows supplied to this prompt:
+{{string.Join(Environment.NewLine, matchedPairLines)}}
+
+Recent persisted events from SQL, ordered by occurrence time:
 {{string.Join(Environment.NewLine, eventLines)}}
 
 Question: {{question}}
 
-Answer concisely. Say whether the System A type 2 to System B unique event correlation is present, and cite the observed evidence from the context.
+Answer concisely. Explain the deterministic SQL-computed finding in plain language and cite only the time-window evidence supplied above. Do not imply a shared correlation key exists. Do not claim statistical significance, causation, proof, or confidence beyond the supplied time-window counts. Do not invent timestamps, counts, or unmatched-event claims. If you cite timestamps, copy them only from the exact matched event examples.
 """;
+    }
+
+    private static string CreateCorrectivePrompt(string originalPrompt, string previousAnswer, CorrelationStatus status) =>
+        $$"""
+{{originalPrompt}}
+
+Your previous answer was not sufficiently grounded:
+{{previousAnswer}}
+
+Rewrite the answer using exactly this format and no other claims:
+- Finding: The SQL event dataset {{(status.TemporalMatches > 0 ? "supports" : "does not yet support")}} the temporal hypothesis.
+- Evidence: {{status.TemporalMatches}} System A type 2 event(s) were followed by System B type 9002 within {{status.TemporalWindowSeconds}} seconds.
+- Example: Cite one exact matched event example from the supplied examples, or say no example was supplied.
+- Limit: This is time-window evidence only; it does not prove causation or statistical significance.
+
+Rules: do not use the words statistically, significant, probability, proves, confidence, or correlation key. Do not add counts other than {{status.TemporalMatches}} and {{status.TemporalWindowSeconds}}.
+""";
+
+    private static bool IsGroundedAnswer(string answer, CorrelationStatus status)
+    {
+        string[] forbiddenTerms = ["statistically", "probability", "proves", "proof", "confidence", "correlation key"];
+        var requiredEvidence = $"Evidence: {status.TemporalMatches} System A type 2 event(s) were followed by System B type 9002 within {status.TemporalWindowSeconds} seconds";
+        return answer.Contains(requiredEvidence, StringComparison.OrdinalIgnoreCase)
+            && !forbiddenTerms.Any(term => answer.Contains(term, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string CreateVerifiedSqlAnswer(IReadOnlyList<CorrelationEvent> events, CorrelationStatus status)
+    {
+        var matchedPairLines = CreateMatchedPairLines(events, status.TemporalWindowSeconds);
+        var example = matchedPairLines.Count > 0
+            ? matchedPairLines[0]
+            : "No exact matched example was supplied in the current SQL event context.";
+
+        return $$"""
+Finding: The persisted SQL event dataset {{(status.TemporalMatches > 0 ? "supports" : "does not yet support")}} the temporal hypothesis.
+Evidence: {{status.TemporalMatches}} System A type 2 event(s) were followed by System B type 9002 within {{status.TemporalWindowSeconds}} seconds.
+Example: {{example}}
+Limit: This is time-window evidence only; it does not prove causation or statistical significance.
+""";
+    }
+
+    private static IReadOnlyList<string> CreateMatchedPairLines(IReadOnlyList<CorrelationEvent> events, int temporalWindowSeconds)
+    {
+        var orderedEvents = events.OrderBy(eventItem => eventItem.OccurredAt).ToArray();
+        var window = TimeSpan.FromSeconds(temporalWindowSeconds);
+        var pairs = new List<string>();
+
+        foreach (var systemAEvent in orderedEvents.Where(eventItem =>
+            eventItem.SourceSystem == "System A"
+            && eventItem.EventType == CorrelationEventFactory.SystemATypeThatCausesSystemB))
+        {
+            var systemBEvent = orderedEvents.FirstOrDefault(eventItem =>
+                eventItem.SourceSystem == "System B"
+                && eventItem.EventType == CorrelationEventFactory.SystemBUniqueEventType
+                && eventItem.OccurredAt >= systemAEvent.OccurredAt
+                && eventItem.OccurredAt - systemAEvent.OccurredAt <= window);
+
+            if (systemBEvent is not null)
+            {
+                pairs.Add($"- System A type 2 at {systemAEvent.OccurredAt:O}; System B type 9002 at {systemBEvent.OccurredAt:O}; elapsed {(systemBEvent.OccurredAt - systemAEvent.OccurredAt).TotalSeconds:0.###} seconds.");
+            }
+        }
+
+        return pairs.Count > 0
+            ? pairs.Take(8).ToArray()
+            : ["- No matched event examples were present in the supplied recent rows."];
     }
 
     private static string CreateFallbackAnswer(string question, CorrelationStatus status)
     {
-        var detected = status.MatchedCorrelationKeys > 0;
+        var detected = status.TemporalMatches > 0;
         return detected
-            ? $"Local fallback summary because the LLM is not ready: yes, the correlation is present. I found {status.SystemAType2Events} System A type 2 event(s), {status.SystemBUniqueEvents} System B unique event(s), and {status.MatchedCorrelationKeys} shared correlation key match(es). Question: {question}"
-            : $"Local fallback summary because the LLM is not ready: the enforced correlation has not been observed yet. System A type 2 events: {status.SystemAType2Events}; System B unique events: {status.SystemBUniqueEvents}; shared keys: {status.MatchedCorrelationKeys}. Question: {question}";
+            ? $"Local fallback summary because the LLM is not ready: the SQL event dataset supports the temporal correlation hypothesis. {status.TemporalMatches} System A type 2 event(s) were followed by System B type 9002 within {status.TemporalWindowSeconds} seconds. Question: {question}"
+            : $"Local fallback summary because the LLM is not ready: the SQL event dataset does not yet show the temporal correlation. System A type 2 events: {status.SystemAType2Events}; System B type 9002 events: {status.SystemBUniqueEvents}; time-window matches: {status.TemporalMatches}. Question: {question}";
     }
 }

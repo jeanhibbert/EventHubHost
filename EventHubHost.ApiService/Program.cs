@@ -1,4 +1,7 @@
 using EventHubHost.ApiService;
+using EventHubHost.ApiService.Data;
+using EventHubHost.ApiService.Hubs;
+using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -7,11 +10,14 @@ builder.AddServiceDefaults();
 
 // Add services to the container.
 builder.Services.AddProblemDetails();
-builder.Services.Configure<QdrantOptions>(builder.Configuration.GetSection("Qdrant"));
 builder.Services.Configure<OllamaOptions>(builder.Configuration.GetSection("Ollama"));
+builder.Services.Configure<CorrelationOptions>(builder.Configuration.GetSection("Correlation"));
+builder.Services.AddPooledDbContextFactory<CorrelationDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("eventdb")));
 builder.Services.AddSingleton<EventRepository>();
-builder.Services.AddHttpClient<QdrantEventVectorStore>();
-builder.Services.AddHttpClient<OllamaCorrelationClient>();
+builder.Services.AddSingleton<OllamaCorrelationClient>();
+builder.Services.AddSignalR();
+builder.Services.AddHostedService<CorrelationDatabaseInitializer>();
 builder.Services.AddHostedService<EventSimulationWorker>();
 
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
@@ -54,6 +60,8 @@ app.MapPost("/scenarios/type2", async (EventRepository repository, CancellationT
     return Results.Ok(events);
 })
 .WithName("TriggerType2CorrelationScenario");
+
+app.MapHub<EventIngestionHub>("/hubs/events");
 
 app.MapDefaultEndpoints();
 

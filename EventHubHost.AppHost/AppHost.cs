@@ -1,8 +1,9 @@
 var builder = DistributedApplication.CreateBuilder(args);
 
-var vectorDb = builder.AddContainer("vectordb", "qdrant/qdrant", "v1.13.4")
-    .WithHttpEndpoint(targetPort: 6333, name: "http")
-    .WithVolume("eventhubhost-qdrant-data", "/qdrant/storage");
+var sql = builder.AddSqlServer("sqlserver")
+    .WithDataVolume("eventhubhost-sqlserver-data");
+
+var eventDb = sql.AddDatabase("eventdb");
 
 var llm = builder.AddContainer("llm", "ollama/ollama", "0.5.7")
     .WithHttpEndpoint(targetPort: 11434, name: "http")
@@ -10,9 +11,9 @@ var llm = builder.AddContainer("llm", "ollama/ollama", "0.5.7")
 
 var apiService = builder.AddProject<Projects.EventHubHost_ApiService>("apiservice")
     .WithHttpHealthCheck("/health")
-    .WithEnvironment("Qdrant__Endpoint", vectorDb.GetEndpoint("http"))
+    .WithReference(eventDb)
     .WithEnvironment("Ollama__Endpoint", llm.GetEndpoint("http"))
-    .WaitFor(vectorDb)
+    .WaitFor(eventDb)
     .WaitFor(llm);
 
 builder.AddProject<Projects.EventHubHost_Web>("webfrontend")
