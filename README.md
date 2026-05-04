@@ -176,4 +176,5 @@ dotnet test .\EventHubHost.Tests\EventHubHost.Tests.csproj --logger "console;ver
 
 - [docs/architecture.md](docs/architecture.md) — detailed component diagram, Ask sequence diagram, RAG retrieval flow, grounded-answer guard, and operational notes.
 - [docs/improvements.md](docs/improvements.md) — the seven improvement areas implemented on top of the baseline (streaming answers, anomaly-triggered insights, hybrid retrieval, insight memory, golden-question harness, telemetry, GPU toggle) and how to enable each.
+- [docs/proposal-trading-systems.md](docs/proposal-trading-systems.md) — proposal framing for using this proof of concept as a cross-system correlation pattern between independent trading systems (executive summary, use cases, risks, 90-day roadmap).
 - [llm-event-correlation-context.md](llm-event-correlation-context.md) — the original design context document used to seed the implementation.
