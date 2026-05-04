@@ -167,7 +167,27 @@ else
 
 		hubConnection.On<CorrelationEvent>("EventIngested", async _ =>
 		{
-			await InvokeAsync(async () => await RefreshAsync());
+			// Run on Blazor's sync context, but bypass RunAsync so we do not
+			// toggle the shared `busy` flag while an Ask call is in flight,
+			// and explicitly request a re-render — SignalR callbacks do not
+			// trigger one automatically the way UI event handlers do.
+			try
+			{
+				var newStatus = await CorrelationApi.GetStatusAsync();
+				await InvokeAsync(() =>
+				{
+					status = newStatus;
+					StateHasChanged();
+				});
+			}
+			catch (Exception ex)
+			{
+				await InvokeAsync(() =>
+				{
+					error = ex.Message;
+					StateHasChanged();
+				});
+			}
 		});
 
 		await hubConnection.StartAsync();
