@@ -1,5 +1,9 @@
 var builder = DistributedApplication.CreateBuilder(args);
 
+// Feature toggle: when Llm:UseGpu = true, expose all NVIDIA GPUs to the Ollama container.
+// Requires the host to have the NVIDIA Container Toolkit installed; safe default is false.
+var useGpu = string.Equals(builder.Configuration["Llm:UseGpu"], "true", StringComparison.OrdinalIgnoreCase);
+
 var sql = builder.AddSqlServer("sqlserver")
     .WithDataVolume("eventhubhost-sqlserver-data");
 
@@ -13,11 +17,17 @@ var llm = builder.AddContainer("llm", "ollama/ollama", "0.5.7")
     .WithHttpEndpoint(targetPort: 11434, name: "http")
     .WithVolume("eventhubhost-ollama-data", "/root/.ollama");
 
+if (useGpu)
+{
+    llm = llm.WithContainerRuntimeArgs("--gpus=all");
+}
+
 var apiService = builder.AddProject<Projects.EventHubHost_ApiService>("apiservice")
     .WithHttpHealthCheck("/health")
     .WithReference(eventDb)
     .WithEnvironment("Qdrant__Endpoint", vectorDb.GetEndpoint("http"))
     .WithEnvironment("Ollama__Endpoint", llm.GetEndpoint("http"))
+    .WithEnvironment("Llm__UseGpu", useGpu ? "true" : "false")
     .WaitFor(eventDb)
     .WaitFor(vectorDb)
     .WaitFor(llm);

@@ -2,27 +2,34 @@ using EventHubHost.ApiService;
 using EventHubHost.ApiService.Data;
 using EventHubHost.ApiService.Hubs;
 using Microsoft.EntityFrameworkCore;
+using OpenTelemetry.Trace;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add service defaults & Aspire client integrations.
 builder.AddServiceDefaults();
 
+// Add the EventHubHost ActivitySource to the OpenTelemetry tracer so spans flow to the Aspire dashboard.
+builder.Services.ConfigureOpenTelemetryTracerProvider(tracing => tracing.AddSource(CorrelationTelemetry.SourceName));
+
 // Add services to the container.
 builder.Services.AddProblemDetails();
 builder.Services.Configure<OllamaOptions>(builder.Configuration.GetSection("Ollama"));
 builder.Services.Configure<QdrantOptions>(builder.Configuration.GetSection("Qdrant"));
 builder.Services.Configure<CorrelationOptions>(builder.Configuration.GetSection("Correlation"));
+builder.Services.Configure<AnomalyOptions>(builder.Configuration.GetSection("Anomaly"));
 builder.Services.AddPooledDbContextFactory<CorrelationDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("eventdb")));
 builder.Services.AddSingleton<OllamaEmbeddingClient>();
 builder.Services.AddSingleton<QdrantEventVectorStore>();
+builder.Services.AddSingleton<QdrantInsightVectorStore>();
 builder.Services.AddSingleton<InsightRepository>();
 builder.Services.AddSingleton<EventRepository>();
 builder.Services.AddSingleton<OllamaCorrelationClient>();
 builder.Services.AddSignalR();
 builder.Services.AddHostedService<CorrelationDatabaseInitializer>();
 builder.Services.AddHostedService<EventSimulationWorker>();
+builder.Services.AddHostedService<AnomalyDetectionWorker>();
 
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
@@ -52,6 +59,16 @@ app.MapPost("/correlations/query", async (CorrelationQueryRequest request, Event
     return await llm.AskAsync(request.Question, events, status, cancellationToken);
 })
 .WithName("QueryCorrelationInsights");
+
+// Streaming endpoint: returns the deterministic SQL-derived answer immediately and a streamId the
+// Blazor UI subscribes to over SignalR for token-by-token LLM elaboration.
+app.MapPost("/correlations/query/stream", async (CorrelationQueryRequest request, EventRepository repository, OllamaCorrelationClient llm, CancellationToken cancellationToken) =>
+{
+    var events = await repository.GetRecentAsync(80, cancellationToken);
+    var status = await repository.GetStatusAsync(cancellationToken);
+    return await llm.BeginStreamingAskAsync(request.Question, events, status, cancellationToken);
+})
+.WithName("QueryCorrelationInsightsStreaming");
 
 app.MapGet("/correlations/insights", async (InsightRepository insights, int? take, CancellationToken cancellationToken) =>
     await insights.GetRecentAsync(take is > 0 ? take.Value : 25, cancellationToken))

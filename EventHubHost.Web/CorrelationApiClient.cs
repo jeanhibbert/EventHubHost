@@ -14,6 +14,18 @@ public sealed class CorrelationApiClient(HttpClient httpClient)
         return await response.Content.ReadFromJsonAsync<CorrelationQueryResponse>(cancellationToken);
     }
 
+    /// <summary>
+    /// Begins a streaming Ask. The deterministic SQL-derived answer is returned synchronously;
+    /// the LLM elaboration arrives over SignalR (channel "InsightTokenAppended" / "InsightAnswerCompleted")
+    /// keyed by the returned StreamId.
+    /// </summary>
+    public async Task<CorrelationStreamResponse?> AskStreamAsync(string question, CancellationToken cancellationToken = default)
+    {
+        var response = await httpClient.PostAsJsonAsync("/correlations/query/stream", new CorrelationQueryRequest(question), cancellationToken);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<CorrelationStreamResponse>(cancellationToken);
+    }
+
     public async Task TriggerType2ScenarioAsync(CancellationToken cancellationToken = default)
     {
         var response = await httpClient.PostAsync("/scenarios/type2", content: null, cancellationToken);
@@ -39,6 +51,30 @@ public sealed record CorrelationQueryResponse(
     string Answer,
     bool UsedLlm,
     IReadOnlyList<CorrelationEvent> ContextEvents);
+
+public sealed record CorrelationStreamResponse(
+    Guid StreamId,
+    string DeterministicAnswer,
+    int RecentEventCount,
+    int VectorMatchCount);
+
+public sealed record InsightTokenMessage(Guid StreamId, string TokenDelta);
+
+public sealed record InsightCompletedMessage(
+    Guid StreamId,
+    string FinalAnswer,
+    bool UsedLlm,
+    int VectorMatchCount,
+    int RecentEventCount);
+
+public sealed record AnomalyAlert(
+    Guid Id,
+    DateTimeOffset DetectedAt,
+    string SourceSystem,
+    int? EventType,
+    double ObservedRate,
+    double ExpectedRate,
+    string Explanation);
 
 public sealed record CorrelationStatus(
     int TotalEvents,
