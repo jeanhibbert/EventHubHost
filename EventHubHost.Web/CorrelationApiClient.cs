@@ -19,6 +19,10 @@ public sealed class CorrelationApiClient(HttpClient httpClient)
         var response = await httpClient.PostAsync("/scenarios/type2", content: null, cancellationToken);
         response.EnsureSuccessStatusCode();
     }
+
+    public async Task<IReadOnlyList<InsightRecord>> GetRecentInsightsAsync(int take = 25, CancellationToken cancellationToken = default) =>
+        await httpClient.GetFromJsonAsync<IReadOnlyList<InsightRecord>>($"/correlations/insights?take={take}", cancellationToken)
+            ?? [];
 }
 
 public sealed record CorrelationEvent(
@@ -45,7 +49,20 @@ public sealed record CorrelationStatus(
     int TemporalMatches,
     int TemporalWindowSeconds,
     bool SqlStoreAvailable,
+    bool VectorStoreAvailable,
+    string EmbeddingModel,
     IReadOnlyList<CorrelationEvent> RecentEvents);
+
+public sealed record InsightRecord(
+    Guid Id,
+    DateTimeOffset AskedAt,
+    string Question,
+    string Answer,
+    bool UsedLlm,
+    int VectorMatchCount,
+    int RecentEventCount,
+    int TemporalMatches,
+    int TemporalWindowSeconds);
 
 public sealed class CorrelationApiOptions
 {

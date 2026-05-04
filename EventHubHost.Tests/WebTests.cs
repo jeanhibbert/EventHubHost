@@ -7,8 +7,8 @@ namespace EventHubHost.Tests;
 public class WebTests
 {
     private static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan ContainerStartupTimeout = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan LlmQueryTimeout = TimeSpan.FromMinutes(12);
+    private static readonly TimeSpan ContainerStartupTimeout = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan LlmQueryTimeout = TimeSpan.FromMinutes(30);
 
     [Fact]
     public async Task GetWebResourceRootReturnsOkStatusCode()
@@ -27,7 +27,12 @@ public class WebTests
         });
         appHost.Services.ConfigureHttpClientDefaults(clientBuilder =>
         {
-            clientBuilder.AddStandardResilienceHandler();
+            clientBuilder.AddStandardResilienceHandler(options =>
+            {
+                options.AttemptTimeout.Timeout = TimeSpan.FromMinutes(5);
+                options.TotalRequestTimeout.Timeout = TimeSpan.FromMinutes(5);
+                options.CircuitBreaker.SamplingDuration = TimeSpan.FromMinutes(10);
+            });
         });
 
         await using var app = await appHost.BuildAsync(cancellationToken).WaitAsync(ContainerStartupTimeout, cancellationToken);
@@ -54,6 +59,15 @@ public class WebTests
             logging.SetMinimumLevel(LogLevel.Debug);
             logging.AddFilter(appHost.Environment.ApplicationName, LogLevel.Debug);
             logging.AddFilter("Aspire.", LogLevel.Debug);
+        });
+        appHost.Services.ConfigureHttpClientDefaults(clientBuilder =>
+        {
+            clientBuilder.AddStandardResilienceHandler(options =>
+            {
+                options.AttemptTimeout.Timeout = LlmQueryTimeout;
+                options.TotalRequestTimeout.Timeout = LlmQueryTimeout;
+                options.CircuitBreaker.SamplingDuration = LlmQueryTimeout * 2;
+            });
         });
 
         await using var app = await appHost.BuildAsync(cancellationToken).WaitAsync(ContainerStartupTimeout, cancellationToken);
@@ -98,6 +112,8 @@ public class WebTests
         // Assert
         Assert.NotNull(status);
         Assert.True(status.SqlStoreAvailable);
+        Assert.True(status.VectorStoreAvailable);
+        Assert.False(string.IsNullOrWhiteSpace(status.EmbeddingModel));
         Assert.True(status.SystemAType2Events >= 1);
         Assert.True(status.SystemBUniqueEvents >= 1);
         Assert.True(status.TemporalMatches >= 1);
@@ -114,6 +130,14 @@ public class WebTests
             || insight.Answer.Contains("time", StringComparison.OrdinalIgnoreCase)
             || insight.Answer.Contains("window", StringComparison.OrdinalIgnoreCase)
             || insight.Answer.Contains("after", StringComparison.OrdinalIgnoreCase));
+
+        var insightHistory = await apiClient.GetFromJsonAsync<IReadOnlyList<InsightRecord>>("/correlations/insights?take=10", cancellationToken).WaitAsync(DefaultTimeout, cancellationToken);
+        Assert.NotNull(insightHistory);
+        Assert.NotEmpty(insightHistory);
+        var latest = insightHistory[0];
+        Assert.Equal(insight.Answer, latest.Answer);
+        Assert.True(latest.UsedLlm);
+        Assert.True(latest.TemporalMatches >= 1);
     }
 
     private sealed record CorrelationQueryRequest(string Question);
@@ -132,7 +156,20 @@ public class WebTests
         int TemporalMatches,
         int TemporalWindowSeconds,
         bool SqlStoreAvailable,
+        bool VectorStoreAvailable,
+        string EmbeddingModel,
         IReadOnlyList<CorrelationEvent> RecentEvents);
+
+    private sealed record InsightRecord(
+        Guid Id,
+        DateTimeOffset AskedAt,
+        string Question,
+        string Answer,
+        bool UsedLlm,
+        int VectorMatchCount,
+        int RecentEventCount,
+        int TemporalMatches,
+        int TemporalWindowSeconds);
 
     private sealed record CorrelationEvent(
         Guid Id,

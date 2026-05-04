@@ -64,8 +64,11 @@ else
 			<span class="badge @(status.SqlStoreAvailable ? "text-bg-success" : "text-bg-warning")">
 				SQL dataset @(status.SqlStoreAvailable ? "online" : "offline")
 			</span>
+			<span class="badge @(status.VectorStoreAvailable ? "text-bg-success" : "text-bg-warning")">
+				Vector DB @(status.VectorStoreAvailable ? "online" : "offline")
+			</span>
 		</div>
-		<p class="text-secondary small mb-2">Matching window: @status.TemporalWindowSeconds seconds after a System A type 2 event.</p>
+		<p class="text-secondary small mb-2">Matching window: @status.TemporalWindowSeconds seconds after a System A type 2 event. Embedding model: <code>@status.EmbeddingModel</code>.</p>
 		<textarea class="form-control mb-2" rows="3" @bind="question"></textarea>
 		<button class="btn btn-primary" @onclick="AskAsync" disabled="@(busy || string.IsNullOrWhiteSpace(question))">Ask</button>
 	</section>
@@ -82,6 +85,35 @@ else
 			<p class="mb-0 whitespace-preserve">@insight.Answer</p>
 		</section>
 	}
+
+	<section class="mb-4">
+		<details>
+			<summary class="h5 mb-2" style="cursor: pointer;">Insight history (@insightHistory.Count)</summary>
+			@if (insightHistory.Count == 0)
+			{
+				<p class="text-secondary small mb-0">No prompts have been asked yet.</p>
+			}
+			else
+			{
+				<ul class="list-unstyled mb-0">
+					@foreach (var record in insightHistory)
+					{
+						<li class="border rounded p-2 mb-2">
+							<div class="d-flex flex-wrap justify-content-between gap-2 mb-1">
+								<strong class="small">@record.AskedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")</strong>
+								<span class="badge @(record.UsedLlm ? "text-bg-success" : "text-bg-secondary")">
+									@(record.UsedLlm ? "Ollama" : "Local fallback")
+								</span>
+							</div>
+							<div class="small text-secondary mb-1">Vector matches: @record.VectorMatchCount &middot; SQL events: @record.RecentEventCount &middot; Temporal: @record.TemporalMatches</div>
+							<div class="mb-1"><em>Q:</em> @record.Question</div>
+							<div class="whitespace-preserve"><em>A:</em> @record.Answer</div>
+						</li>
+					}
+				</ul>
+			}
+		</details>
+	</section>
 
 	<section>
 		<h2 class="h5">Recent events</h2>
@@ -114,6 +146,7 @@ else
 @code {
 	private CorrelationStatus? status;
 	private CorrelationQueryResponse? insight;
+	private IReadOnlyList<InsightRecord> insightHistory = [];
 	private string question = "Does the SQL event history show that System B unique events tend to happen shortly after System A type 2 events?";
 	private string? error;
 	private bool busy;
@@ -142,7 +175,11 @@ else
 
 	private async Task RefreshAsync()
 	{
-		await RunAsync(async () => status = await CorrelationApi.GetStatusAsync());
+		await RunAsync(async () =>
+		{
+			status = await CorrelationApi.GetStatusAsync();
+			insightHistory = await CorrelationApi.GetRecentInsightsAsync();
+		});
 	}
 
 	private async Task TriggerScenarioAsync()
@@ -160,6 +197,7 @@ else
 		{
 			insight = await CorrelationApi.AskAsync(question);
 			status = await CorrelationApi.GetStatusAsync();
+			insightHistory = await CorrelationApi.GetRecentInsightsAsync();
 		});
 	}
 

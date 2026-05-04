@@ -11,9 +11,13 @@ builder.AddServiceDefaults();
 // Add services to the container.
 builder.Services.AddProblemDetails();
 builder.Services.Configure<OllamaOptions>(builder.Configuration.GetSection("Ollama"));
+builder.Services.Configure<QdrantOptions>(builder.Configuration.GetSection("Qdrant"));
 builder.Services.Configure<CorrelationOptions>(builder.Configuration.GetSection("Correlation"));
 builder.Services.AddPooledDbContextFactory<CorrelationDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("eventdb")));
+builder.Services.AddSingleton<OllamaEmbeddingClient>();
+builder.Services.AddSingleton<QdrantEventVectorStore>();
+builder.Services.AddSingleton<InsightRepository>();
 builder.Services.AddSingleton<EventRepository>();
 builder.Services.AddSingleton<OllamaCorrelationClient>();
 builder.Services.AddSignalR();
@@ -48,6 +52,10 @@ app.MapPost("/correlations/query", async (CorrelationQueryRequest request, Event
     return await llm.AskAsync(request.Question, events, status, cancellationToken);
 })
 .WithName("QueryCorrelationInsights");
+
+app.MapGet("/correlations/insights", async (InsightRepository insights, int? take, CancellationToken cancellationToken) =>
+    await insights.GetRecentAsync(take is > 0 ? take.Value : 25, cancellationToken))
+    .WithName("GetRecentInsights");
 
 app.MapPost("/scenarios/type2", async (EventRepository repository, CancellationToken cancellationToken) =>
 {

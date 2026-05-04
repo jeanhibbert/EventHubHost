@@ -16,6 +16,27 @@ public sealed class CorrelationDatabaseInitializer(
             {
                 await using var dbContext = await dbContextFactory.CreateDbContextAsync(cancellationToken);
                 await dbContext.Database.EnsureCreatedAsync(cancellationToken);
+                // EnsureCreatedAsync does not migrate schemas; when the SQL volume already exists from
+                // a previous run the new Insights table will be missing. Create it idempotently.
+                await dbContext.Database.ExecuteSqlRawAsync(
+                    """
+                    IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = N'Insights')
+                    BEGIN
+                        CREATE TABLE [Insights] (
+                            [Id] uniqueidentifier NOT NULL CONSTRAINT [PK_Insights] PRIMARY KEY,
+                            [AskedAt] datetimeoffset NOT NULL,
+                            [Question] nvarchar(2000) NOT NULL,
+                            [Answer] nvarchar(max) NOT NULL,
+                            [UsedLlm] bit NOT NULL,
+                            [VectorMatchCount] int NOT NULL,
+                            [RecentEventCount] int NOT NULL,
+                            [TemporalMatches] int NOT NULL,
+                            [TemporalWindowSeconds] int NOT NULL
+                        );
+                        CREATE INDEX [IX_Insights_AskedAt] ON [Insights] ([AskedAt]);
+                    END
+                    """,
+                    cancellationToken);
                 logger.LogInformation("Correlation SQL database is ready.");
                 return;
             }
