@@ -6,6 +6,7 @@ public sealed class CorrelationDbContext(DbContextOptions<CorrelationDbContext> 
 {
     public DbSet<CorrelationEventEntity> Events => Set<CorrelationEventEntity>();
     public DbSet<InsightRecordEntity> Insights => Set<InsightRecordEntity>();
+    public DbSet<AnomalyRecordEntity> Anomalies => Set<AnomalyRecordEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -24,5 +25,14 @@ public sealed class CorrelationDbContext(DbContextOptions<CorrelationDbContext> 
         insightEntity.Property(insight => insight.Question).HasMaxLength(2000).IsRequired();
         insightEntity.Property(insight => insight.Answer).IsRequired();
         insightEntity.HasIndex(insight => insight.AskedAt);
+
+        var anomalyEntity = modelBuilder.Entity<AnomalyRecordEntity>();
+        anomalyEntity.ToTable("Anomalies");
+        anomalyEntity.HasKey(anomaly => anomaly.Id);
+        anomalyEntity.Property(anomaly => anomaly.Severity).HasMaxLength(32).IsRequired();
+        anomalyEntity.Property(anomaly => anomaly.SourceSystem).HasMaxLength(64).IsRequired();
+        anomalyEntity.Property(anomaly => anomaly.Explanation).IsRequired();
+        anomalyEntity.HasIndex(anomaly => anomaly.DetectedAt);
+        anomalyEntity.HasIndex(anomaly => new { anomaly.Severity, anomaly.DetectedAt });
     }
 }

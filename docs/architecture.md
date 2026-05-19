@@ -34,7 +34,7 @@ flowchart TB
     subgraph Containers["Aspire-managed containers"]
         SQL[("SQL Server<br/>eventdb<br/>Tables: Events, Insights")]
         QDR[("Qdrant v1.13.4<br/>collection: events<br/>768-dim cosine")]
-        LLM["Ollama 0.5.7<br/>llama3.2:3b<br/>nomic-embed-text"]
+        LLM["Ollama 0.5.7<br/>llama3.1:8b<br/>nomic-embed-text"]
     end
 
     UI --> APICLIENT
@@ -132,7 +132,7 @@ sequenceDiagram
     Q-->>O: top-12 semantically similar events
 
     O->>O: CreatePrompt(question, recentEvents, vectorMatches, status)
-    O->>LLM: POST /api/generate { llama3.2:3b, prompt, keep_alive=30m, temperature=0.1 }
+    O->>LLM: POST /api/generate { llama3.1:8b, prompt, keep_alive=30m, temperature=0.1 }
     LLM-->>O: answer
 
     alt answer omits required evidence sentence OR uses forbidden words
@@ -198,7 +198,7 @@ The mitigations used in this codebase:
 
 ### 5.2 Ollama warm-up
 
-The first `/api/generate` call after a container start can take a long time because the model is loaded into memory on demand. Subsequent calls are fast as long as `keep_alive` is honoured. Every call sends `keep_alive: "30m"` to keep both `llama3.2:3b` and `nomic-embed-text` resident.
+The first `/api/generate` call after a container start can take a long time because the model is loaded into memory on demand. Subsequent calls are fast as long as `keep_alive` is honoured. Every call sends `keep_alive: "30m"` to keep both `llama3.1:8b` and `nomic-embed-text` resident.
 
 ### 5.3 SQL schema upgrade strategy
 

@@ -20,6 +20,16 @@ public sealed class CorrelationDatabaseInitializer(
                 // a previous run the new Insights table will be missing. Create it idempotently.
                 await dbContext.Database.ExecuteSqlRawAsync(
                     """
+                    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Events_OccurredAt' AND object_id = OBJECT_ID(N'[Events]'))
+                    BEGIN
+                        CREATE INDEX [IX_Events_OccurredAt] ON [Events] ([OccurredAt]);
+                    END
+
+                    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Events_SourceSystem_EventType_OccurredAt' AND object_id = OBJECT_ID(N'[Events]'))
+                    BEGIN
+                        CREATE INDEX [IX_Events_SourceSystem_EventType_OccurredAt] ON [Events] ([SourceSystem], [EventType], [OccurredAt]);
+                    END
+
                     IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = N'Insights')
                     BEGIN
                         CREATE TABLE [Insights] (
@@ -34,6 +44,23 @@ public sealed class CorrelationDatabaseInitializer(
                             [TemporalWindowSeconds] int NOT NULL
                         );
                         CREATE INDEX [IX_Insights_AskedAt] ON [Insights] ([AskedAt]);
+                    END
+
+                    IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = N'Anomalies')
+                    BEGIN
+                        CREATE TABLE [Anomalies] (
+                            [Id] uniqueidentifier NOT NULL CONSTRAINT [PK_Anomalies] PRIMARY KEY,
+                            [DetectedAt] datetimeoffset NOT NULL,
+                            [Severity] nvarchar(32) NOT NULL,
+                            [SourceSystem] nvarchar(64) NOT NULL,
+                            [EventType] int NULL,
+                            [ObservedRate] float NOT NULL,
+                            [ExpectedRate] float NOT NULL,
+                            [Explanation] nvarchar(max) NOT NULL,
+                            [UsedLlm] bit NOT NULL
+                        );
+                        CREATE INDEX [IX_Anomalies_DetectedAt] ON [Anomalies] ([DetectedAt]);
+                        CREATE INDEX [IX_Anomalies_Severity_DetectedAt] ON [Anomalies] ([Severity], [DetectedAt]);
                     END
                     """,
                     cancellationToken);

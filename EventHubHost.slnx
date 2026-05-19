@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/Solution Items/">
     <File Path="llm-event-correlation-context.md" />
+    <File Path="README.md" />
   </Folder>
   <Project Path="EventHubHost.ApiService/EventHubHost.ApiService.csproj" />
   <Project Path="EventHubHost.AppHost/EventHubHost.AppHost.csproj" />

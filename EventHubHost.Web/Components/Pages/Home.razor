@@ -53,7 +53,7 @@ else
 		<div class="col-sm-6 col-xl-3">
 			<div class="metric-panel">
 				<span>Temporal matches</span>
-				<strong>@status.TemporalMatches</strong>
+				<strong class="@(status.TemporalMatches > 0 ? "text-success" : string.Empty)">@status.TemporalMatches</strong>
 			</div>
 		</div>
 	</div>
@@ -70,8 +70,55 @@ else
 		</div>
 		<p class="text-secondary small mb-2">Matching window: @status.TemporalWindowSeconds seconds after a System A type 2 event. Embedding model: <code>@status.EmbeddingModel</code>.</p>
 		<textarea class="form-control mb-2" rows="3" @bind="question"></textarea>
-		<button class="btn btn-primary" @onclick="AskAsync" disabled="@(busy || string.IsNullOrWhiteSpace(question))">Ask</button>
+		<div class="d-flex gap-2 mb-2">
+			<button class="btn btn-primary" @onclick="AskStreamingAsync" disabled="@(busy || string.IsNullOrWhiteSpace(question))">Ask (streaming)</button>
+			<button class="btn btn-outline-secondary" @onclick="AskAsync" disabled="@(busy || string.IsNullOrWhiteSpace(question))">Ask (synchronous)</button>
+		</div>
 	</section>
+
+	@if (anomalyAlerts.Count > 0)
+	{
+		<section class="mb-4">
+			<h2 class="h5">Anomaly notifications</h2>
+			<ul class="list-unstyled mb-0">
+				@foreach (var alert in anomalyAlerts)
+				{
+					<li class="alert alert-info py-2 mb-2">
+						<div class="d-flex flex-wrap justify-content-between gap-2">
+							<div class="d-flex flex-wrap align-items-center gap-2">
+								<strong>@alert.SourceSystem@(alert.EventType.HasValue ? $" type {alert.EventType.Value}" : string.Empty)</strong>
+								<span class="badge @SeverityBadgeClass(alert.Severity)">@alert.Severity</span>
+								<span class="badge @(alert.UsedLlm ? "text-bg-success" : "text-bg-secondary")">@(alert.UsedLlm ? "Ollama" : "SQL")</span>
+							</div>
+							<span class="small text-secondary">@alert.DetectedAt.ToLocalTime().ToString("HH:mm:ss") &middot; observed @alert.ObservedRate.ToString("0.##") vs expected @alert.ExpectedRate.ToString("0.##")</span>
+						</div>
+						<div class="small whitespace-preserve mt-1">@alert.Explanation</div>
+					</li>
+				}
+			</ul>
+		</section>
+	}
+
+	@if (streamingDeterministic is not null)
+	{
+		<section class="insight-panel mb-4">
+			<div class="d-flex flex-wrap justify-content-between gap-2 mb-2">
+				<h2 class="h5 mb-0">Deterministic answer (instant)</h2>
+				<span class="badge text-bg-info">SQL</span>
+			</div>
+			<p class="mb-0 whitespace-preserve">@streamingDeterministic</p>
+		</section>
+
+		<section class="insight-panel mb-4">
+			<div class="d-flex flex-wrap justify-content-between gap-2 mb-2">
+				<h2 class="h5 mb-0">LLM elaboration @(streamingCompleted ? "" : "(streaming…)")</h2>
+				<span class="badge @(streamingCompleted ? "text-bg-success" : "text-bg-secondary")">
+					@(streamingCompleted ? "Done" : "Streaming")
+				</span>
+			</div>
+			<p class="mb-0 whitespace-preserve">@streamingTokens</p>
+		</section>
+	}
 
 	@if (insight is not null)
 	{
@@ -130,7 +177,7 @@ else
 				<tbody>
 					@foreach (var eventItem in status.RecentEvents)
 					{
-						<tr>
+						<tr class="@EventRowClass(eventItem)">
 							<td>@eventItem.OccurredAt.ToLocalTime().ToString("HH:mm:ss")</td>
 							<td>@eventItem.SourceSystem</td>
 							<td>@eventItem.EventType</td>
@@ -147,10 +194,16 @@ else
 	private CorrelationStatus? status;
 	private CorrelationQueryResponse? insight;
 	private IReadOnlyList<InsightRecord> insightHistory = [];
+	private IReadOnlyList<AnomalyRecord> anomalyAlerts = [];
 	private string question = "Does the SQL event history show that System B unique events tend to happen shortly after System A type 2 events?";
 	private string? error;
 	private bool busy;
 	private HubConnection? hubConnection;
+
+	private Guid? activeStreamId;
+	private string? streamingDeterministic;
+	private string streamingTokens = string.Empty;
+	private bool streamingCompleted;
 
 	protected override async Task OnInitializedAsync()
 	{
@@ -190,6 +243,41 @@ else
 			}
 		});
 
+		hubConnection.On<InsightTokenMessage>("InsightTokenAppended", async msg =>
+		{
+			if (activeStreamId.HasValue && msg.StreamId == activeStreamId.Value)
+			{
+				await InvokeAsync(() =>
+				{
+					streamingTokens += msg.TokenDelta;
+					StateHasChanged();
+				});
+			}
+		});
+
+		hubConnection.On<InsightCompletedMessage>("InsightAnswerCompleted", async msg =>
+		{
+			if (activeStreamId.HasValue && msg.StreamId == activeStreamId.Value)
+			{
+				await InvokeAsync(async () =>
+				{
+					streamingTokens = msg.FinalAnswer;
+					streamingCompleted = true;
+					StateHasChanged();
+					try { insightHistory = await CorrelationApi.GetRecentInsightsAsync(); StateHasChanged(); } catch { }
+				});
+			}
+		});
+
+		hubConnection.On<AnomalyRecord>("AnomalyDetected", async alert =>
+		{
+			await InvokeAsync(() =>
+			{
+				anomalyAlerts = MergeAnomaly(alert, anomalyAlerts, 10);
+				StateHasChanged();
+			});
+		});
+
 		await hubConnection.StartAsync();
 	}
 
@@ -199,8 +287,30 @@ else
 		{
 			status = await CorrelationApi.GetStatusAsync();
 			insightHistory = await CorrelationApi.GetRecentInsightsAsync();
+			anomalyAlerts = await CorrelationApi.GetRecentAnomaliesAsync(10);
 		});
 	}
+
+	private static IReadOnlyList<AnomalyRecord> MergeAnomaly(AnomalyRecord alert, IReadOnlyList<AnomalyRecord> existing, int take) =>
+		new[] { alert }
+			.Concat(existing.Where(item => item.Id != alert.Id))
+			.OrderByDescending(item => item.DetectedAt)
+			.Take(take)
+			.ToArray();
+
+	private static string SeverityBadgeClass(string severity) => severity.ToLowerInvariant() switch
+	{
+		"critical" => "text-bg-danger",
+		"high" => "text-bg-warning",
+		_ => "text-bg-info"
+	};
+
+	private static string EventRowClass(CorrelationEvent eventItem) =>
+		eventItem.SourceSystem == "System A" && eventItem.EventType == 2
+			? "table-warning"
+			: eventItem.SourceSystem == "System B" && eventItem.EventType == 9002
+				? "table-info"
+				: string.Empty;
 
 	private async Task TriggerScenarioAsync()
 	{
@@ -219,6 +329,34 @@ else
 			status = await CorrelationApi.GetStatusAsync();
 			insightHistory = await CorrelationApi.GetRecentInsightsAsync();
 		});
+	}
+
+	private async Task AskStreamingAsync()
+	{
+		insight = null;
+		streamingTokens = string.Empty;
+		streamingCompleted = false;
+		streamingDeterministic = null;
+		error = null;
+		busy = true;
+		try
+		{
+			var response = await CorrelationApi.AskStreamAsync(question);
+			if (response is not null)
+			{
+				activeStreamId = response.StreamId;
+				streamingDeterministic = response.DeterministicAnswer;
+			}
+			status = await CorrelationApi.GetStatusAsync();
+		}
+		catch (Exception ex)
+		{
+			error = ex.Message;
+		}
+		finally
+		{
+			busy = false;
+		}
 	}
 
 	private async Task RunAsync(Func<Task> action)

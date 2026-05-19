@@ -1,6 +1,10 @@
+using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using EventHubHost.ApiService.Data;
 using EventHubHost.ApiService.Hubs;
 using Microsoft.AspNetCore.SignalR;
@@ -23,6 +27,37 @@ public sealed record CorrelationQueryResponse(
     string Answer,
     bool UsedLlm,
     IReadOnlyList<CorrelationEvent> ContextEvents);
+
+/// <summary>
+/// Initial response to a streaming Ask: contains the deterministic SQL-only answer (returned
+/// immediately so the user always sees a correct answer with no waiting) and a streamId the
+/// client subscribes to over SignalR to receive token deltas + the final LLM-elaborated answer.
+/// </summary>
+public sealed record CorrelationStreamResponse(
+    Guid StreamId,
+    string DeterministicAnswer,
+    int RecentEventCount,
+    int VectorMatchCount);
+
+public sealed record InsightTokenMessage(Guid StreamId, string TokenDelta);
+
+public sealed record InsightCompletedMessage(
+    Guid StreamId,
+    string FinalAnswer,
+    bool UsedLlm,
+    int VectorMatchCount,
+    int RecentEventCount);
+
+public sealed record AnomalyRecord(
+    Guid Id,
+    DateTimeOffset DetectedAt,
+    string Severity,
+    string SourceSystem,
+    int? EventType,
+    double ObservedRate,
+    double ExpectedRate,
+    string Explanation,
+    bool UsedLlm);
 
 public sealed record CorrelationStatus(
     int TotalEvents,
@@ -51,7 +86,7 @@ public sealed record InsightRecord(
 public sealed class OllamaOptions
 {
     public string Endpoint { get; set; } = "http://localhost:11434";
-    public string Model { get; set; } = "llama3.2:1b";
+    public string Model { get; set; } = "llama3.1:8b";
     public string EmbeddingModel { get; set; } = "nomic-embed-text";
     public bool AutoPullModel { get; set; } = true;
 }
@@ -60,12 +95,26 @@ public sealed class QdrantOptions
 {
     public string Endpoint { get; set; } = "http://localhost:6333";
     public string Collection { get; set; } = "events";
+    public string InsightCollection { get; set; } = "insights";
     public int VectorSize { get; set; } = 768;
 }
 
 public sealed class CorrelationOptions
 {
     public int TemporalWindowSeconds { get; set; } = 15;
+    public int VectorSearchTopK { get; set; } = 12;
+    public int MaxRecentEventsForPrompt { get; set; } = 30;
+    public int InsightMemoryTopK { get; set; } = 3;
+}
+
+public sealed class AnomalyOptions
+{
+    public bool Enabled { get; set; } = true;
+    public int ScanIntervalSeconds { get; set; } = 30;
+    public int WindowSeconds { get; set; } = 300;
+    public int BinSeconds { get; set; } = 5;
+    public int MinPointsToScan { get; set; } = 24;
+    public double Sensitivity { get; set; } = 90.0;
 }
 
 public static class CorrelationEventFactory
@@ -160,6 +209,10 @@ public sealed class EventRepository(
 {
     public async Task AddAsync(CorrelationEvent eventItem, CancellationToken cancellationToken)
     {
+        using var activity = CorrelationTelemetry.Source.StartActivity("ingest.event", ActivityKind.Internal);
+        activity?.SetTag("event.source_system", eventItem.SourceSystem);
+        activity?.SetTag("event.type", eventItem.EventType);
+
         try
         {
             await using var dbContext = await dbContextFactory.CreateDbContextAsync(cancellationToken);
@@ -168,6 +221,7 @@ public sealed class EventRepository(
         }
         catch (Exception ex)
         {
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             logger.LogWarning(ex, "SQL event persistence failed.");
             throw;
         }
@@ -280,9 +334,12 @@ public sealed class EventRepository(
 
 public sealed class OllamaCorrelationClient(
     IOptions<OllamaOptions> options,
+    IOptions<CorrelationOptions> correlationOptions,
     OllamaEmbeddingClient embeddingClient,
     QdrantEventVectorStore vectorStore,
+    QdrantInsightVectorStore insightVectorStore,
     InsightRepository insightRepository,
+    IHubContext<EventIngestionHub> hubContext,
     ILogger<OllamaCorrelationClient> logger) : IDisposable
 {
     private readonly HttpClient httpClient = new()
@@ -297,26 +354,23 @@ public sealed class OllamaCorrelationClient(
         CorrelationStatus status,
         CancellationToken cancellationToken)
     {
+        using var activity = CorrelationTelemetry.Source.StartActivity("llm.ask", ActivityKind.Internal);
+        activity?.SetTag("question.length", question.Length);
+
         ConfigureClient();
 
-        IReadOnlyList<CorrelationEvent> vectorMatches = [];
-        try
-        {
-            var questionEmbedding = await embeddingClient.EmbedAsync(question, cancellationToken);
-            vectorMatches = await vectorStore.SearchAsync(questionEmbedding, topK: 12, cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "Vector search failed; proceeding with SQL temporal context only.");
-        }
+        var (vectorMatches, pastInsights) = await RetrieveContextAsync(question, cancellationToken);
+        activity?.SetTag("retrieval.vector_matches", vectorMatches.Count);
+        activity?.SetTag("retrieval.past_insights", pastInsights.Count);
 
-        var prompt = CreatePrompt(question, events, vectorMatches, status);
+        var prompt = CreatePrompt(question, events, vectorMatches, pastInsights, status, correlationOptions.Value);
 
         for (var attempt = 1; attempt <= 3; attempt++)
         {
             try
             {
                 var answer = await GenerateAsync(prompt, allowModelPull: true, cancellationToken);
+                var usedLlm = true;
                 if (!IsGroundedAnswer(answer, status))
                 {
                     var correctivePrompt = CreateCorrectivePrompt(prompt, answer, status);
@@ -326,9 +380,10 @@ public sealed class OllamaCorrelationClient(
                 if (!IsGroundedAnswer(answer, status))
                 {
                     answer = CreateVerifiedSqlAnswer(events, status);
+                    usedLlm = false;
                 }
 
-                var response = new CorrelationQueryResponse(answer, true, events.Take(30).ToArray());
+                var response = new CorrelationQueryResponse(answer, usedLlm, events.Take(30).ToArray());
                 await RecordInsightAsync(question, response, vectorMatches.Count, events.Count, status, cancellationToken);
                 return response;
             }
@@ -340,6 +395,7 @@ public sealed class OllamaCorrelationClient(
             catch (Exception ex)
             {
                 logger.LogWarning(ex, "Ollama generation failed; returning local temporal correlation summary.");
+                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
                 var fallback = new CorrelationQueryResponse(CreateFallbackAnswer(question, status), false, events.Take(30).ToArray());
                 await RecordInsightAsync(question, fallback, vectorMatches.Count, events.Count, status, cancellationToken);
                 return fallback;
@@ -349,6 +405,120 @@ public sealed class OllamaCorrelationClient(
         var failed = new CorrelationQueryResponse(CreateFallbackAnswer(question, status), false, events.Take(30).ToArray());
         await RecordInsightAsync(question, failed, vectorMatches.Count, events.Count, status, cancellationToken);
         return failed;
+    }
+
+    /// <summary>
+    /// Begins a streaming Ask. Returns immediately with a deterministic SQL-only answer and a
+    /// streamId; the LLM elaboration is generated in the background and broadcast token-by-token
+    /// over SignalR ("InsightTokenAppended"), with a final "InsightAnswerCompleted" event when
+    /// the grounded answer is verified and persisted.
+    /// </summary>
+    public async Task<CorrelationStreamResponse> BeginStreamingAskAsync(
+        string question,
+        IReadOnlyList<CorrelationEvent> events,
+        CorrelationStatus status,
+        CancellationToken cancellationToken)
+    {
+        ConfigureClient();
+        var streamId = Guid.NewGuid();
+        var deterministicAnswer = CreateVerifiedSqlAnswer(events, status);
+
+        var (vectorMatches, pastInsights) = await RetrieveContextAsync(question, cancellationToken);
+
+        // Run the long LLM call on the background scheduler so the HTTP caller returns now.
+        _ = Task.Run(() => StreamLlmElaborationAsync(streamId, question, events, vectorMatches, pastInsights, status, deterministicAnswer), CancellationToken.None);
+
+        return new CorrelationStreamResponse(streamId, deterministicAnswer, events.Count, vectorMatches.Count);
+    }
+
+    private async Task StreamLlmElaborationAsync(
+        Guid streamId,
+        string question,
+        IReadOnlyList<CorrelationEvent> events,
+        IReadOnlyList<CorrelationEvent> vectorMatches,
+        IReadOnlyList<InsightRecord> pastInsights,
+        CorrelationStatus status,
+        string deterministicAnswer)
+    {
+        using var activity = CorrelationTelemetry.Source.StartActivity("llm.ask.streaming", ActivityKind.Internal);
+        activity?.SetTag("stream.id", streamId);
+
+        var prompt = CreatePrompt(question, events, vectorMatches, pastInsights, status, correlationOptions.Value);
+        var collected = new StringBuilder();
+        var usedLlm = true;
+        try
+        {
+            await foreach (var token in GenerateStreamAsync(prompt, CancellationToken.None))
+            {
+                collected.Append(token);
+                try
+                {
+                    await hubContext.Clients.All.SendAsync("InsightTokenAppended", new InsightTokenMessage(streamId, token));
+                }
+                catch (Exception ex)
+                {
+                    logger.LogDebug(ex, "Token broadcast failed.");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Streaming LLM call failed; falling back to deterministic answer.");
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            usedLlm = false;
+        }
+
+        var rawAnswer = collected.Length > 0 ? collected.ToString() : deterministicAnswer;
+        var finalAnswer = IsGroundedAnswer(rawAnswer, status) ? rawAnswer : deterministicAnswer;
+        if (!IsGroundedAnswer(rawAnswer, status))
+        {
+            usedLlm = false;
+        }
+
+        try
+        {
+            await hubContext.Clients.All.SendAsync(
+                "InsightAnswerCompleted",
+                new InsightCompletedMessage(streamId, finalAnswer, usedLlm, vectorMatches.Count, events.Count));
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Completion broadcast failed.");
+        }
+
+        await RecordInsightAsync(question, new CorrelationQueryResponse(finalAnswer, usedLlm, events.Take(30).ToArray()), vectorMatches.Count, events.Count, status, CancellationToken.None);
+    }
+
+    private async Task<(IReadOnlyList<CorrelationEvent> VectorMatches, IReadOnlyList<InsightRecord> PastInsights)> RetrieveContextAsync(string question, CancellationToken cancellationToken)
+    {
+        IReadOnlyList<CorrelationEvent> vectorMatches = [];
+        IReadOnlyList<InsightRecord> pastInsights = [];
+        try
+        {
+            using var embedSpan = CorrelationTelemetry.Source.StartActivity("llm.embed.question");
+            var questionEmbedding = await embeddingClient.EmbedAsync(question, cancellationToken);
+            embedSpan?.SetTag("embedding.length", questionEmbedding.Length);
+
+            var entities = EntityExtractor.Extract(question);
+            using (var searchSpan = CorrelationTelemetry.Source.StartActivity("vector.search.events"))
+            {
+                searchSpan?.SetTag("filter.systems", string.Join(",", entities.SourceSystems));
+                searchSpan?.SetTag("filter.types", string.Join(",", entities.EventTypes));
+                vectorMatches = await vectorStore.SearchAsync(questionEmbedding, correlationOptions.Value.VectorSearchTopK, entities, cancellationToken);
+            }
+
+            using (var insightSpan = CorrelationTelemetry.Source.StartActivity("vector.search.insights"))
+            {
+                pastInsights = await insightVectorStore.SearchAsync(questionEmbedding, correlationOptions.Value.InsightMemoryTopK, cancellationToken);
+                insightSpan?.SetTag("matches", pastInsights.Count);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Retrieval failed; proceeding with SQL temporal context only.");
+        }
+
+        return (vectorMatches, pastInsights);
     }
 
     private async Task RecordInsightAsync(
@@ -380,6 +550,10 @@ public sealed class OllamaCorrelationClient(
 
     private async Task<string> GenerateAsync(string prompt, bool allowModelPull, CancellationToken cancellationToken)
     {
+        using var span = CorrelationTelemetry.Source.StartActivity("llm.generate");
+        span?.SetTag("llm.model", options.Value.Model);
+        span?.SetTag("prompt.length", prompt.Length);
+
         var response = await httpClient.PostAsJsonAsync("/api/generate", new
         {
             model = options.Value.Model,
@@ -413,6 +587,62 @@ public sealed class OllamaCorrelationClient(
         return document.RootElement.TryGetProperty("response", out var answer)
             ? answer.GetString() ?? "The LLM returned an empty response."
             : "The LLM response did not include an answer.";
+    }
+
+    /// <summary>
+    /// Streaming variant: yields incremental token chunks from Ollama's /api/generate (NDJSON when
+    /// stream=true). Each line of the response body is a JSON object with a "response" property
+    /// containing the next token chunk; the final line carries "done":true.
+    /// </summary>
+    private async IAsyncEnumerable<string> GenerateStreamAsync(string prompt, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        using var span = CorrelationTelemetry.Source.StartActivity("llm.generate.stream");
+        span?.SetTag("llm.model", options.Value.Model);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/generate")
+        {
+            Content = JsonContent.Create(new
+            {
+                model = options.Value.Model,
+                prompt,
+                stream = true,
+                keep_alive = "30m",
+                options = new { temperature = 0.1 }
+            })
+        };
+
+        using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+
+        while (!reader.EndOfStream)
+        {
+            var line = await reader.ReadLineAsync(cancellationToken);
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            string? token = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                if (doc.RootElement.TryGetProperty("response", out var part))
+                {
+                    token = part.GetString();
+                }
+            }
+            catch (JsonException)
+            {
+                // skip malformed line
+            }
+
+            if (!string.IsNullOrEmpty(token))
+            {
+                yield return token;
+            }
+        }
     }
 
     private async Task PullModelAsync(CancellationToken cancellationToken)
@@ -452,24 +682,38 @@ public sealed class OllamaCorrelationClient(
         string question,
         IReadOnlyList<CorrelationEvent> events,
         IReadOnlyList<CorrelationEvent> vectorMatches,
-        CorrelationStatus status)
+        IReadOnlyList<InsightRecord> pastInsights,
+        CorrelationStatus status,
+        CorrelationOptions correlationOptions)
     {
         var eventLines = events
             .OrderBy(eventItem => eventItem.OccurredAt)
-            .TakeLast(30)
+            .TakeLast(correlationOptions.MaxRecentEventsForPrompt)
             .Select(eventItem =>
                 $"- {eventItem.OccurredAt:O} | {eventItem.SourceSystem} | type {eventItem.EventType} | {eventItem.Description}");
         var vectorLines = vectorMatches.Count > 0
             ? vectorMatches.Select(eventItem =>
                 $"- {eventItem.OccurredAt:O} | {eventItem.SourceSystem} | type {eventItem.EventType} | {eventItem.Description}")
             : ["- No semantically similar events were retrieved from the vector store."];
+        var insightLines = pastInsights.Count > 0
+            ? pastInsights.Select(insight =>
+                $"- ({insight.AskedAt:O}) Q: {Truncate(insight.Question, 120)} | A: {Truncate(insight.Answer, 200)}")
+            : ["- No prior related questions were found in the insight memory."];
         var matchedPairLines = CreateMatchedPairLines(events, status.TemporalWindowSeconds);
         var computedFinding = status.TemporalMatches > 0
             ? $"SUPPORTED: the SQL analysis found {status.TemporalMatches} time-window match(es). A time-window match means a System A type 2 event was followed by System B type 9002 within {status.TemporalWindowSeconds} seconds."
             : "NOT YET SUPPORTED: the SQL analysis found zero time-window matches.";
 
         return $$"""
-You are a centralized event correlation analyst. Use only the supplied SQL event dataset context, vector-retrieved similar events, and temporal summary.
+You are a centralized event correlation analyst.
+
+Rules:
+1. Use only the supplied SQL event dataset context, vector-retrieved similar events, and temporal summary.
+2. Answer in no more than 120 words.
+3. Include the SQL-computed time-window count and window exactly as supplied.
+4. Do not imply a shared identity, trace, transaction, or correlation key exists.
+5. Do not claim statistical significance, causation, proof, or confidence beyond the supplied time-window counts.
+6. Do not invent timestamps, counts, or unmatched-event claims.
 
 The source systems are independent. There is no shared correlation ID, key, trace ID, or transaction ID. Do not claim that events are linked by identity. Reason only from event timing, event type, and observed counts.
 
@@ -496,10 +740,27 @@ Recent SQL events (temporal context), ordered by occurrence time:
 Vector-retrieved similar events (semantic context from Qdrant):
 {{string.Join(Environment.NewLine, vectorLines)}}
 
+Past related questions (from insight memory):
+{{string.Join(Environment.NewLine, insightLines)}}
+
 Question: {{question}}
 
-Answer concisely. Explain the deterministic SQL-computed finding in plain language and cite only the time-window evidence supplied above. Do not imply a shared correlation key exists. Do not claim statistical significance, causation, proof, or confidence beyond the supplied time-window counts. Do not invent timestamps, counts, or unmatched-event claims. If you cite timestamps, copy them only from the exact matched event examples.
+Answer format:
+- Finding: one sentence.
+- Evidence: one sentence using the supplied time-window count and window.
+- Limit: one sentence.
+
+Explain the deterministic SQL-computed finding in plain language and cite only the time-window evidence supplied above. If you cite timestamps, copy them only from the exact matched event examples.
 """;
+    }
+
+    private static string Truncate(string value, int maxLength)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
+        {
+            return value ?? string.Empty;
+        }
+        return value[..maxLength] + "…";
     }
 
     private static string CreateCorrectivePrompt(string originalPrompt, string previousAnswer, CorrelationStatus status) =>
@@ -518,13 +779,58 @@ Rewrite the answer using exactly this format and no other claims:
 Rules: do not use the words statistically, significant, probability, proves, confidence, or correlation key. Do not add counts other than {{status.TemporalMatches}} and {{status.TemporalWindowSeconds}}.
 """;
 
-    private static bool IsGroundedAnswer(string answer, CorrelationStatus status)
+    internal static bool IsGroundedAnswer(string answer, CorrelationStatus status)
     {
         string[] forbiddenTerms = ["statistically", "probability", "proves", "proof", "confidence", "correlation key"];
         var requiredEvidence = $"Evidence: {status.TemporalMatches} System A type 2 event(s) were followed by System B type 9002 within {status.TemporalWindowSeconds} seconds";
-        return answer.Contains(requiredEvidence, StringComparison.OrdinalIgnoreCase)
-            && !forbiddenTerms.Any(term => answer.Contains(term, StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(answer)
+            || forbiddenTerms.Any(term => answer.Contains(term, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        if (answer.Contains(requiredEvidence, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var normalized = Regex.Replace(answer.ToLowerInvariant(), @"\s+", " ");
+        var includesExpectedCounts = ContainsMatchCount(normalized, status.TemporalMatches)
+            && ContainsNumber(normalized, status.TemporalWindowSeconds);
+        var includesSystemsAndTypes = normalized.Contains("system a", StringComparison.Ordinal)
+            && normalized.Contains("type 2", StringComparison.Ordinal)
+            && normalized.Contains("system b", StringComparison.Ordinal)
+            && ContainsNumber(normalized, CorrelationEventFactory.SystemBUniqueEventType);
+        var describesTemporalEvidence = normalized.Contains("within", StringComparison.Ordinal)
+            || normalized.Contains("follow", StringComparison.Ordinal)
+            || normalized.Contains("after", StringComparison.Ordinal)
+            || normalized.Contains("window", StringComparison.Ordinal);
+        var referencesHypothesis = normalized.Contains("hypothesis", StringComparison.Ordinal)
+            || normalized.Contains("evidence", StringComparison.Ordinal)
+            || normalized.Contains("match", StringComparison.Ordinal)
+            || normalized.Contains("support", StringComparison.Ordinal);
+
+        if (!includesExpectedCounts || !includesSystemsAndTypes || !describesTemporalEvidence || !referencesHypothesis)
+        {
+            return false;
+        }
+
+        return status.TemporalMatches > 0
+            ? normalized.Contains("support", StringComparison.Ordinal)
+                || normalized.Contains("evidence", StringComparison.Ordinal)
+                || normalized.Contains("match", StringComparison.Ordinal)
+            : normalized.Contains("zero", StringComparison.Ordinal)
+                || normalized.Contains("no ", StringComparison.Ordinal)
+                || normalized.Contains("not yet", StringComparison.Ordinal)
+                || normalized.Contains("does not", StringComparison.Ordinal);
     }
+
+    private static bool ContainsNumber(string value, int number) =>
+        Regex.IsMatch(value, $@"(?<!\d){number}(?!\d)");
+
+    private static bool ContainsMatchCount(string value, int temporalMatches) =>
+        ContainsNumber(value, temporalMatches)
+        || temporalMatches == 0 && value.Contains("zero", StringComparison.Ordinal);
 
     private static string CreateVerifiedSqlAnswer(IReadOnlyList<CorrelationEvent> events, CorrelationStatus status)
     {
@@ -712,15 +1018,42 @@ public sealed class QdrantEventVectorStore(IOptions<QdrantOptions> options, ILog
         response.EnsureSuccessStatusCode();
     }
 
-    public async Task<IReadOnlyList<CorrelationEvent>> SearchAsync(float[] embedding, int topK, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<CorrelationEvent>> SearchAsync(float[] embedding, int topK, CancellationToken cancellationToken) =>
+        await SearchAsync(embedding, topK, entities: null, cancellationToken);
+
+    /// <summary>
+    /// Hybrid retrieval: combines vector similarity with a Qdrant payload filter built from
+    /// regex-extracted entities (source systems, event-type numbers). When entities is null or
+    /// empty, behaves as a pure vector search.
+    /// </summary>
+    public async Task<IReadOnlyList<CorrelationEvent>> SearchAsync(float[] embedding, int topK, QuestionEntities? entities, CancellationToken cancellationToken)
     {
         ConfigureClient();
         await EnsureCollectionAsync(cancellationToken);
+
+        object? filter = null;
+        if (entities is not null && entities.HasFilters)
+        {
+            var must = new List<object>();
+            foreach (var system in entities.SourceSystems)
+            {
+                must.Add(new { key = "sourceSystem", match = new { value = system } });
+            }
+            foreach (var type in entities.EventTypes)
+            {
+                must.Add(new { key = "eventType", match = new { value = type } });
+            }
+            if (must.Count > 0)
+            {
+                filter = new { must };
+            }
+        }
 
         var response = await httpClient.PostAsJsonAsync($"/collections/{options.Value.Collection}/points/search", new
         {
             vector = embedding,
             limit = topK,
+            filter,
             with_payload = true,
             with_vector = false
         }, cancellationToken);
@@ -886,6 +1219,8 @@ public sealed class QdrantEventVectorStore(IOptions<QdrantOptions> options, ILog
 
 public sealed class InsightRepository(
     IDbContextFactory<CorrelationDbContext> dbContextFactory,
+    OllamaEmbeddingClient embeddingClient,
+    QdrantInsightVectorStore insightVectorStore,
     ILogger<InsightRepository> logger)
 {
     public async Task AddAsync(InsightRecord record, CancellationToken cancellationToken)
@@ -910,6 +1245,18 @@ public sealed class InsightRepository(
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Failed to persist insight record.");
+        }
+
+        // Insight memory: best-effort embed + upsert into the dedicated Qdrant collection so that
+        // future Ask calls can surface semantically related past Q/A pairs.
+        try
+        {
+            var embedding = await embeddingClient.EmbedAsync(record.Question + " | " + record.Answer, cancellationToken);
+            await insightVectorStore.UpsertAsync(record, embedding, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Insight vector upsert failed (non-fatal).");
         }
     }
 
@@ -938,6 +1285,65 @@ public sealed class InsightRepository(
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Failed to read insight history.");
+            return [];
+        }
+    }
+}
+
+public sealed class AnomalyRepository(
+    IDbContextFactory<CorrelationDbContext> dbContextFactory,
+    ILogger<AnomalyRepository> logger)
+{
+    public async Task AddAsync(AnomalyRecord record, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var dbContext = await dbContextFactory.CreateDbContextAsync(cancellationToken);
+            dbContext.Anomalies.Add(new AnomalyRecordEntity
+            {
+                Id = record.Id,
+                DetectedAt = record.DetectedAt,
+                Severity = record.Severity,
+                SourceSystem = record.SourceSystem,
+                EventType = record.EventType,
+                ObservedRate = record.ObservedRate,
+                ExpectedRate = record.ExpectedRate,
+                Explanation = record.Explanation,
+                UsedLlm = record.UsedLlm
+            });
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to persist anomaly record.");
+        }
+    }
+
+    public async Task<IReadOnlyList<AnomalyRecord>> GetRecentAsync(int take, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var dbContext = await dbContextFactory.CreateDbContextAsync(cancellationToken);
+            var rows = await dbContext.Anomalies
+                .AsNoTracking()
+                .OrderByDescending(anomaly => anomaly.DetectedAt)
+                .Take(take)
+                .ToArrayAsync(cancellationToken);
+
+            return rows.Select(row => new AnomalyRecord(
+                row.Id,
+                row.DetectedAt,
+                row.Severity,
+                row.SourceSystem,
+                row.EventType,
+                row.ObservedRate,
+                row.ExpectedRate,
+                row.Explanation,
+                row.UsedLlm)).ToArray();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to read anomaly history.");
             return [];
         }
     }
