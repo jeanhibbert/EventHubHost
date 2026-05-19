@@ -1,3 +1,4 @@
+using EventHubHost.ApiService;
 using Microsoft.Extensions.Logging;
 using System.Net.Http.Json;
 
@@ -27,6 +28,36 @@ public class GoldenQuestionTests
 
     private static readonly string[] ForbiddenTerms =
         ["statistically", "probability", "proves", "proof", "confidence", "correlation key"];
+
+    [Fact]
+    public void GroundingGuardAcceptsCorrectParaphrase()
+    {
+        var status = CreateStatus(temporalMatches: 4, temporalWindowSeconds: 15);
+
+        var answer = "Finding: the SQL data supports the temporal hypothesis. Evidence: 4 matches show System A type 2 is followed after by System B type 9002 within a 15 second window. Limit: timing evidence only.";
+
+        Assert.True(OllamaCorrelationClient.IsGroundedAnswer(answer, status));
+    }
+
+    [Fact]
+    public void GroundingGuardRejectsForbiddenClaims()
+    {
+        var status = CreateStatus(temporalMatches: 4, temporalWindowSeconds: 15);
+
+        var answer = "Evidence: 4 System A type 2 event(s) were followed by System B type 9002 within 15 seconds. This proves the systems are linked.";
+
+        Assert.False(OllamaCorrelationClient.IsGroundedAnswer(answer, status));
+    }
+
+    [Fact]
+    public void GroundingGuardAcceptsZeroMatchParaphrase()
+    {
+        var status = CreateStatus(temporalMatches: 0, temporalWindowSeconds: 15);
+
+        var answer = "Finding: the SQL data does not yet support the hypothesis. Evidence: zero matches show System A type 2 followed by System B type 9002 within the 15 second window. Limit: timing evidence only.";
+
+        Assert.True(OllamaCorrelationClient.IsGroundedAnswer(answer, status));
+    }
 
     [Theory]
     [Trait("Category", "Live")]
@@ -89,4 +120,18 @@ public class GoldenQuestionTests
     private sealed record GoldenRequest(string Question);
     private sealed record GoldenResponse(string Answer, bool UsedLlm);
     private sealed record GoldenStatus(int TemporalMatches, int TemporalWindowSeconds);
+
+    private static CorrelationStatus CreateStatus(int temporalMatches, int temporalWindowSeconds) =>
+        new(
+            TotalEvents: 0,
+            SystemAEvents: 0,
+            SystemBEvents: 0,
+            SystemAType2Events: 0,
+            SystemBUniqueEvents: 0,
+            TemporalMatches: temporalMatches,
+            TemporalWindowSeconds: temporalWindowSeconds,
+            SqlStoreAvailable: true,
+            VectorStoreAvailable: true,
+            EmbeddingModel: "nomic-embed-text",
+            RecentEvents: []);
 }

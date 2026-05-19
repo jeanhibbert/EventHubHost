@@ -24,6 +24,7 @@ builder.Services.AddSingleton<OllamaEmbeddingClient>();
 builder.Services.AddSingleton<QdrantEventVectorStore>();
 builder.Services.AddSingleton<QdrantInsightVectorStore>();
 builder.Services.AddSingleton<InsightRepository>();
+builder.Services.AddSingleton<AnomalyRepository>();
 builder.Services.AddSingleton<EventRepository>();
 builder.Services.AddSingleton<OllamaCorrelationClient>();
 builder.Services.AddSignalR();
@@ -73,6 +74,10 @@ app.MapPost("/correlations/query/stream", async (CorrelationQueryRequest request
 app.MapGet("/correlations/insights", async (InsightRepository insights, int? take, CancellationToken cancellationToken) =>
     await insights.GetRecentAsync(take is > 0 ? take.Value : 25, cancellationToken))
     .WithName("GetRecentInsights");
+
+app.MapGet("/anomalies/recent", async (AnomalyRepository anomalies, int? take, CancellationToken cancellationToken) =>
+    await anomalies.GetRecentAsync(take is > 0 ? take.Value : 25, cancellationToken))
+    .WithName("GetRecentAnomalies");
 
 app.MapPost("/scenarios/type2", async (EventRepository repository, CancellationToken cancellationToken) =>
 {

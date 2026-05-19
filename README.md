@@ -15,7 +15,7 @@ The defining constraint of the problem is that **the source systems do not share
 5. **Answer correlation questions** ("does System B's event 9002 tend to follow System A's event 2?") using a *Retrieval-Augmented Generation* (RAG) pipeline:
    - A deterministic SQL query supplies the temporal evidence (counts, time-window matches, exact pairs).
    - A vector search supplies semantically similar historical events.
-   - An LLM (Ollama, `llama3.2:3b`) writes the natural-language answer **constrained by the SQL-computed evidence**.
+    - An LLM (Ollama, `llama3.1:8b`) writes the natural-language answer **constrained by the SQL-computed evidence**.
 6. **Persist every prompt and answer** in a SQL `Insights` table so the conversation history is a first-class artifact.
 7. **Fail safely**: if the LLM is unavailable, the API returns a deterministic locally-computed summary; if the vector store is unavailable, the API still answers using SQL temporal context only.
 
@@ -38,7 +38,7 @@ flowchart LR
         WEB["EventHubHost.Web<br/>(Blazor Interactive Server)"]
         SQL[("SQL Server<br/>Events + Insights")]
         QDR[("Qdrant<br/>events collection<br/>768-dim cosine")]
-        LLM["Ollama<br/>llama3.2:3b<br/>+ nomic-embed-text"]
+        LLM["Ollama<br/>llama3.1:8b<br/>+ nomic-embed-text"]
     end
 
     SA -- "simulated" --> API
@@ -61,7 +61,7 @@ A more detailed component diagram, the Ask sequence diagram, and the RAG retriev
 
 ## Why a vector database is relevant for the Ollama LLM
 
-A self-hosted small LLM (here `llama3.2:3b`) has two hard constraints that a vector database directly addresses:
+A self-hosted local LLM (here `llama3.1:8b`) has two hard constraints that a vector database directly addresses:
 
 1. **The context window is small and expensive to fill.** We cannot stuff "every event ever observed" into the prompt. We need to select the *most relevant* slice of history for each question.
 2. **The LLM has no memory between calls.** Anything the model is allowed to "know" about historical events must be supplied in the prompt for that specific call.
@@ -91,7 +91,7 @@ flowchart TB
     SQLR --> CTX
     SQLR --> EVID["Deterministic evidence sentence<br/>SQL-computed, not LLM-computed"]
 
-    CTX --> GEN["Ollama /api/generate<br/>llama3.2:3b, temperature 0.1, keep_alive 30m"]
+    CTX --> GEN["Ollama /api/generate<br/>llama3.1:8b, temperature 0.1, keep_alive 30m"]
     EVID --> GUARD[Grounded-answer guard]
     GEN --> GUARD
 

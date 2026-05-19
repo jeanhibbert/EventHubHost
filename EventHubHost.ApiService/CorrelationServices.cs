@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using EventHubHost.ApiService.Data;
 using EventHubHost.ApiService.Hubs;
 using Microsoft.AspNetCore.SignalR;
@@ -47,14 +48,16 @@ public sealed record InsightCompletedMessage(
     int VectorMatchCount,
     int RecentEventCount);
 
-public sealed record AnomalyAlert(
+public sealed record AnomalyRecord(
     Guid Id,
     DateTimeOffset DetectedAt,
+    string Severity,
     string SourceSystem,
     int? EventType,
     double ObservedRate,
     double ExpectedRate,
-    string Explanation);
+    string Explanation,
+    bool UsedLlm);
 
 public sealed record CorrelationStatus(
     int TotalEvents,
@@ -83,7 +86,7 @@ public sealed record InsightRecord(
 public sealed class OllamaOptions
 {
     public string Endpoint { get; set; } = "http://localhost:11434";
-    public string Model { get; set; } = "llama3.2:1b";
+    public string Model { get; set; } = "llama3.1:8b";
     public string EmbeddingModel { get; set; } = "nomic-embed-text";
     public bool AutoPullModel { get; set; } = true;
 }
@@ -367,6 +370,7 @@ public sealed class OllamaCorrelationClient(
             try
             {
                 var answer = await GenerateAsync(prompt, allowModelPull: true, cancellationToken);
+                var usedLlm = true;
                 if (!IsGroundedAnswer(answer, status))
                 {
                     var correctivePrompt = CreateCorrectivePrompt(prompt, answer, status);
@@ -376,9 +380,10 @@ public sealed class OllamaCorrelationClient(
                 if (!IsGroundedAnswer(answer, status))
                 {
                     answer = CreateVerifiedSqlAnswer(events, status);
+                    usedLlm = false;
                 }
 
-                var response = new CorrelationQueryResponse(answer, true, events.Take(30).ToArray());
+                var response = new CorrelationQueryResponse(answer, usedLlm, events.Take(30).ToArray());
                 await RecordInsightAsync(question, response, vectorMatches.Count, events.Count, status, cancellationToken);
                 return response;
             }
@@ -700,7 +705,15 @@ public sealed class OllamaCorrelationClient(
             : "NOT YET SUPPORTED: the SQL analysis found zero time-window matches.";
 
         return $$"""
-You are a centralized event correlation analyst. Use only the supplied SQL event dataset context, vector-retrieved similar events, and temporal summary.
+You are a centralized event correlation analyst.
+
+Rules:
+1. Use only the supplied SQL event dataset context, vector-retrieved similar events, and temporal summary.
+2. Answer in no more than 120 words.
+3. Include the SQL-computed time-window count and window exactly as supplied.
+4. Do not imply a shared identity, trace, transaction, or correlation key exists.
+5. Do not claim statistical significance, causation, proof, or confidence beyond the supplied time-window counts.
+6. Do not invent timestamps, counts, or unmatched-event claims.
 
 The source systems are independent. There is no shared correlation ID, key, trace ID, or transaction ID. Do not claim that events are linked by identity. Reason only from event timing, event type, and observed counts.
 
@@ -732,7 +745,12 @@ Past related questions (from insight memory):
 
 Question: {{question}}
 
-Answer concisely. Explain the deterministic SQL-computed finding in plain language and cite only the time-window evidence supplied above. Do not imply a shared correlation key exists. Do not claim statistical significance, causation, proof, or confidence beyond the supplied time-window counts. Do not invent timestamps, counts, or unmatched-event claims. If you cite timestamps, copy them only from the exact matched event examples.
+Answer format:
+- Finding: one sentence.
+- Evidence: one sentence using the supplied time-window count and window.
+- Limit: one sentence.
+
+Explain the deterministic SQL-computed finding in plain language and cite only the time-window evidence supplied above. If you cite timestamps, copy them only from the exact matched event examples.
 """;
     }
 
@@ -761,13 +779,58 @@ Rewrite the answer using exactly this format and no other claims:
 Rules: do not use the words statistically, significant, probability, proves, confidence, or correlation key. Do not add counts other than {{status.TemporalMatches}} and {{status.TemporalWindowSeconds}}.
 """;
 
-    private static bool IsGroundedAnswer(string answer, CorrelationStatus status)
+    internal static bool IsGroundedAnswer(string answer, CorrelationStatus status)
     {
         string[] forbiddenTerms = ["statistically", "probability", "proves", "proof", "confidence", "correlation key"];
         var requiredEvidence = $"Evidence: {status.TemporalMatches} System A type 2 event(s) were followed by System B type 9002 within {status.TemporalWindowSeconds} seconds";
-        return answer.Contains(requiredEvidence, StringComparison.OrdinalIgnoreCase)
-            && !forbiddenTerms.Any(term => answer.Contains(term, StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(answer)
+            || forbiddenTerms.Any(term => answer.Contains(term, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        if (answer.Contains(requiredEvidence, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var normalized = Regex.Replace(answer.ToLowerInvariant(), @"\s+", " ");
+        var includesExpectedCounts = ContainsMatchCount(normalized, status.TemporalMatches)
+            && ContainsNumber(normalized, status.TemporalWindowSeconds);
+        var includesSystemsAndTypes = normalized.Contains("system a", StringComparison.Ordinal)
+            && normalized.Contains("type 2", StringComparison.Ordinal)
+            && normalized.Contains("system b", StringComparison.Ordinal)
+            && ContainsNumber(normalized, CorrelationEventFactory.SystemBUniqueEventType);
+        var describesTemporalEvidence = normalized.Contains("within", StringComparison.Ordinal)
+            || normalized.Contains("follow", StringComparison.Ordinal)
+            || normalized.Contains("after", StringComparison.Ordinal)
+            || normalized.Contains("window", StringComparison.Ordinal);
+        var referencesHypothesis = normalized.Contains("hypothesis", StringComparison.Ordinal)
+            || normalized.Contains("evidence", StringComparison.Ordinal)
+            || normalized.Contains("match", StringComparison.Ordinal)
+            || normalized.Contains("support", StringComparison.Ordinal);
+
+        if (!includesExpectedCounts || !includesSystemsAndTypes || !describesTemporalEvidence || !referencesHypothesis)
+        {
+            return false;
+        }
+
+        return status.TemporalMatches > 0
+            ? normalized.Contains("support", StringComparison.Ordinal)
+                || normalized.Contains("evidence", StringComparison.Ordinal)
+                || normalized.Contains("match", StringComparison.Ordinal)
+            : normalized.Contains("zero", StringComparison.Ordinal)
+                || normalized.Contains("no ", StringComparison.Ordinal)
+                || normalized.Contains("not yet", StringComparison.Ordinal)
+                || normalized.Contains("does not", StringComparison.Ordinal);
     }
+
+    private static bool ContainsNumber(string value, int number) =>
+        Regex.IsMatch(value, $@"(?<!\d){number}(?!\d)");
+
+    private static bool ContainsMatchCount(string value, int temporalMatches) =>
+        ContainsNumber(value, temporalMatches)
+        || temporalMatches == 0 && value.Contains("zero", StringComparison.Ordinal);
 
     private static string CreateVerifiedSqlAnswer(IReadOnlyList<CorrelationEvent> events, CorrelationStatus status)
     {
@@ -1222,6 +1285,65 @@ public sealed class InsightRepository(
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Failed to read insight history.");
+            return [];
+        }
+    }
+}
+
+public sealed class AnomalyRepository(
+    IDbContextFactory<CorrelationDbContext> dbContextFactory,
+    ILogger<AnomalyRepository> logger)
+{
+    public async Task AddAsync(AnomalyRecord record, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var dbContext = await dbContextFactory.CreateDbContextAsync(cancellationToken);
+            dbContext.Anomalies.Add(new AnomalyRecordEntity
+            {
+                Id = record.Id,
+                DetectedAt = record.DetectedAt,
+                Severity = record.Severity,
+                SourceSystem = record.SourceSystem,
+                EventType = record.EventType,
+                ObservedRate = record.ObservedRate,
+                ExpectedRate = record.ExpectedRate,
+                Explanation = record.Explanation,
+                UsedLlm = record.UsedLlm
+            });
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to persist anomaly record.");
+        }
+    }
+
+    public async Task<IReadOnlyList<AnomalyRecord>> GetRecentAsync(int take, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var dbContext = await dbContextFactory.CreateDbContextAsync(cancellationToken);
+            var rows = await dbContext.Anomalies
+                .AsNoTracking()
+                .OrderByDescending(anomaly => anomaly.DetectedAt)
+                .Take(take)
+                .ToArrayAsync(cancellationToken);
+
+            return rows.Select(row => new AnomalyRecord(
+                row.Id,
+                row.DetectedAt,
+                row.Severity,
+                row.SourceSystem,
+                row.EventType,
+                row.ObservedRate,
+                row.ExpectedRate,
+                row.Explanation,
+                row.UsedLlm)).ToArray();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to read anomaly history.");
             return [];
         }
     }

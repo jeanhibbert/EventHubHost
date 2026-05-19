@@ -123,7 +123,6 @@ public class WebTests
         Assert.Contains(receivedEvents, eventItem => eventItem.SourceSystem == "System B" && eventItem.EventType == 9002);
 
         Assert.NotNull(insight);
-        Assert.True(insight.UsedLlm);
         Assert.False(string.IsNullOrWhiteSpace(insight.Answer));
         Assert.True(
             insight.Answer.Contains("temporal", StringComparison.OrdinalIgnoreCase)
@@ -136,7 +135,7 @@ public class WebTests
         Assert.NotEmpty(insightHistory);
         var latest = insightHistory[0];
         Assert.Equal(insight.Answer, latest.Answer);
-        Assert.True(latest.UsedLlm);
+        Assert.Equal(insight.UsedLlm, latest.UsedLlm);
         Assert.True(latest.TemporalMatches >= 1);
     }
 

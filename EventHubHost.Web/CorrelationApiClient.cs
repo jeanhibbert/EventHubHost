@@ -35,6 +35,10 @@ public sealed class CorrelationApiClient(HttpClient httpClient)
     public async Task<IReadOnlyList<InsightRecord>> GetRecentInsightsAsync(int take = 25, CancellationToken cancellationToken = default) =>
         await httpClient.GetFromJsonAsync<IReadOnlyList<InsightRecord>>($"/correlations/insights?take={take}", cancellationToken)
             ?? [];
+
+    public async Task<IReadOnlyList<AnomalyRecord>> GetRecentAnomaliesAsync(int take = 25, CancellationToken cancellationToken = default) =>
+        await httpClient.GetFromJsonAsync<IReadOnlyList<AnomalyRecord>>($"/anomalies/recent?take={take}", cancellationToken)
+            ?? [];
 }
 
 public sealed record CorrelationEvent(
@@ -67,14 +71,16 @@ public sealed record InsightCompletedMessage(
     int VectorMatchCount,
     int RecentEventCount);
 
-public sealed record AnomalyAlert(
+public sealed record AnomalyRecord(
     Guid Id,
     DateTimeOffset DetectedAt,
+    string Severity,
     string SourceSystem,
     int? EventType,
     double ObservedRate,
     double ExpectedRate,
-    string Explanation);
+    string Explanation,
+    bool UsedLlm);
 
 public sealed record CorrelationStatus(
     int TotalEvents,

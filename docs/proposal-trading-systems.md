@@ -12,7 +12,7 @@ EventHubHost demonstrates a working pattern for solving this *without* a multi-y
 
 1. Each system continues to emit events into its own store, unchanged.
 2. A thin ingestion layer pushes those events into a **single SQL store of record** plus a **vector index** for semantic recall.
-3. A small local LLM (Ollama `llama3.2:3b`) answers free-text questions over the combined dataset, with a **deterministic SQL-derived answer** always returned first and the LLM elaboration streamed token-by-token afterwards.
+3. A local LLM (Ollama `llama3.1:8b`) answers free-text questions over the combined dataset, with a **deterministic SQL-derived answer** always returned first and the LLM elaboration streamed token-by-token afterwards.
 4. An anomaly detector (ML.NET SR-CNN) watches the per-minute event rate and proactively asks the LLM to explain spikes, broadcasting the result to the UI as a notification.
 5. The whole stack runs locally under .NET Aspire — five containers, one `dotnet run`, no cloud dependency, no per-token cost.
 
@@ -33,7 +33,7 @@ The proof of concept is intentionally scoped to two synthetic systems with one h
 ### 2.2 Where it is intentionally narrow
 
 - Single hard-coded hypothesis (System A type 2 → System B type 9002). A real corporate deployment needs hypotheses to be data-driven or user-defined, not baked into a `CreateMatchedPairLines` helper.
-- `llama3.2:3b` is the smallest useful model. It is great for showing the architecture works on a laptop; for real corporate Q&A you would swap in a 7B–14B model (or a hosted endpoint) with the exact same code path.
+- `llama3.1:8b` is the default local model for stronger instruction following. For real corporate Q&A you could still swap in a larger 14B model or a hosted endpoint with the exact same code path.
 - Two source systems, simulated. Adding a third system is a config change, but the current prompt and evidence sentence assume the binary case.
 - No authentication, no PII redaction, no row-level security on the SQL or vector layer. Those are mandatory before this touches real trading data.
 
@@ -117,7 +117,7 @@ These are **scoping** items, not blockers — each is small relative to the valu
 | Audit trail | Append-only log of every Ask + every Answer + the user who asked | Required by model risk management and by surveillance review. |
 | Model risk governance | Document the model, the prompt, the guard, the golden tests; sign off under SR 11-7 / PRA SS1/23 | Mandatory for any LLM that informs a trading or compliance decision. |
 | HA / DR | SQL Always On; Qdrant snapshots; Ollama replicas behind a load balancer | Trading hours = zero downtime. |
-| Capacity | Move from `llama3.2:3b` to a 7B–14B model (e.g. `llama3.1:8b`, `qwen2.5:14b`) on a single-GPU host; benchmark against golden questions | The architecture does not change; only the model name in `appsettings.json`. |
+| Capacity | Move from `llama3.1:8b` to a larger 14B model (for example `qwen2.5:14b`) on a single-GPU host; benchmark against golden questions | The architecture does not change; only the model name in `appsettings.json`. |
 | Connector framework | Replace `EventSimulationWorker` with one adapter per real system (Kafka, MQ, REST, FIX-drop-copy) | The shape of `CorrelationEvent` already supports any source. |
 | Hypothesis catalogue | Move the hard-coded "A type 2 → B type 9002" rule into a configurable rule set | Real desks have dozens of hypotheses; each becomes a row in a `Hypotheses` table with its own SR-CNN binning + LLM prompt template. |
 | FinOps | Track tokens-per-question and seconds-per-question via the existing OTel spans; alert on regression | LLM cost only stays low if it is measured. |

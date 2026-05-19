@@ -53,7 +53,7 @@ else
 		<div class="col-sm-6 col-xl-3">
 			<div class="metric-panel">
 				<span>Temporal matches</span>
-				<strong>@status.TemporalMatches</strong>
+				<strong class="@(status.TemporalMatches > 0 ? "text-success" : string.Empty)">@status.TemporalMatches</strong>
 			</div>
 		</div>
 	</div>
@@ -85,8 +85,12 @@ else
 				{
 					<li class="alert alert-info py-2 mb-2">
 						<div class="d-flex flex-wrap justify-content-between gap-2">
-							<strong>@alert.SourceSystem@(alert.EventType.HasValue ? $" type {alert.EventType.Value}" : string.Empty)</strong>
-							<span class="small text-secondary">@alert.DetectedAt.ToLocalTime().ToString("HH:mm:ss") &middot; observed @alert.ObservedRate vs expected @alert.ExpectedRate.ToString("0.##")</span>
+							<div class="d-flex flex-wrap align-items-center gap-2">
+								<strong>@alert.SourceSystem@(alert.EventType.HasValue ? $" type {alert.EventType.Value}" : string.Empty)</strong>
+								<span class="badge @SeverityBadgeClass(alert.Severity)">@alert.Severity</span>
+								<span class="badge @(alert.UsedLlm ? "text-bg-success" : "text-bg-secondary")">@(alert.UsedLlm ? "Ollama" : "SQL")</span>
+							</div>
+							<span class="small text-secondary">@alert.DetectedAt.ToLocalTime().ToString("HH:mm:ss") &middot; observed @alert.ObservedRate.ToString("0.##") vs expected @alert.ExpectedRate.ToString("0.##")</span>
 						</div>
 						<div class="small whitespace-preserve mt-1">@alert.Explanation</div>
 					</li>
@@ -173,7 +177,7 @@ else
 				<tbody>
 					@foreach (var eventItem in status.RecentEvents)
 					{
-						<tr>
+						<tr class="@EventRowClass(eventItem)">
 							<td>@eventItem.OccurredAt.ToLocalTime().ToString("HH:mm:ss")</td>
 							<td>@eventItem.SourceSystem</td>
 							<td>@eventItem.EventType</td>
@@ -190,6 +194,7 @@ else
 	private CorrelationStatus? status;
 	private CorrelationQueryResponse? insight;
 	private IReadOnlyList<InsightRecord> insightHistory = [];
+	private IReadOnlyList<AnomalyRecord> anomalyAlerts = [];
 	private string question = "Does the SQL event history show that System B unique events tend to happen shortly after System A type 2 events?";
 	private string? error;
 	private bool busy;
@@ -199,7 +204,6 @@ else
 	private string? streamingDeterministic;
 	private string streamingTokens = string.Empty;
 	private bool streamingCompleted;
-	private readonly List<AnomalyAlert> anomalyAlerts = new();
 
 	protected override async Task OnInitializedAsync()
 	{
@@ -265,15 +269,11 @@ else
 			}
 		});
 
-		hubConnection.On<AnomalyAlert>("AnomalyDetected", async alert =>
+		hubConnection.On<AnomalyRecord>("AnomalyDetected", async alert =>
 		{
 			await InvokeAsync(() =>
 			{
-				anomalyAlerts.Insert(0, alert);
-				if (anomalyAlerts.Count > 10)
-				{
-					anomalyAlerts.RemoveAt(anomalyAlerts.Count - 1);
-				}
+				anomalyAlerts = MergeAnomaly(alert, anomalyAlerts, 10);
 				StateHasChanged();
 			});
 		});
@@ -287,8 +287,30 @@ else
 		{
 			status = await CorrelationApi.GetStatusAsync();
 			insightHistory = await CorrelationApi.GetRecentInsightsAsync();
+			anomalyAlerts = await CorrelationApi.GetRecentAnomaliesAsync(10);
 		});
 	}
+
+	private static IReadOnlyList<AnomalyRecord> MergeAnomaly(AnomalyRecord alert, IReadOnlyList<AnomalyRecord> existing, int take) =>
+		new[] { alert }
+			.Concat(existing.Where(item => item.Id != alert.Id))
+			.OrderByDescending(item => item.DetectedAt)
+			.Take(take)
+			.ToArray();
+
+	private static string SeverityBadgeClass(string severity) => severity.ToLowerInvariant() switch
+	{
+		"critical" => "text-bg-danger",
+		"high" => "text-bg-warning",
+		_ => "text-bg-info"
+	};
+
+	private static string EventRowClass(CorrelationEvent eventItem) =>
+		eventItem.SourceSystem == "System A" && eventItem.EventType == 2
+			? "table-warning"
+			: eventItem.SourceSystem == "System B" && eventItem.EventType == 9002
+				? "table-info"
+				: string.Empty;
 
 	private async Task TriggerScenarioAsync()
 	{

@@ -20,6 +20,7 @@ public sealed class AnomalyDetectionWorker(
     IDbContextFactory<CorrelationDbContext> dbContextFactory,
     OllamaCorrelationClient correlationClient,
     EventRepository eventRepository,
+    AnomalyRepository anomalyRepository,
     IHubContext<EventIngestionHub> hubContext,
     ILogger<AnomalyDetectionWorker> logger) : BackgroundService
 {
@@ -146,6 +147,7 @@ public sealed class AnomalyDetectionWorker(
 
         // Ask the LLM for a one-paragraph explanation, but bound it tightly so we don't block the worker.
         string explanation;
+        var usedLlm = false;
         try
         {
             using var explainCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -155,6 +157,7 @@ public sealed class AnomalyDetectionWorker(
             var question = $"At approximately {binStart:O}, the per-{options.BinSeconds}s event rate for {sourceSystem}{(eventType.HasValue ? " type " + eventType.Value : string.Empty)} was {observed} (SR-CNN expected ~{expected:0.##}). Briefly explain what could cause this spike using only the supplied event context.";
             var response = await correlationClient.AskAsync(question, recent, status, explainCts.Token);
             explanation = response.Answer;
+            usedLlm = response.UsedLlm;
         }
         catch (Exception ex)
         {
@@ -162,14 +165,18 @@ public sealed class AnomalyDetectionWorker(
             explanation = $"Observed event rate {observed} for {sourceSystem} at {binStart:O} exceeded the SR-CNN expected value of {expected:0.##}.";
         }
 
-        var alert = new AnomalyAlert(
+        var alert = new AnomalyRecord(
             Guid.NewGuid(),
             DateTimeOffset.UtcNow,
+            CalculateSeverity(observed, expected),
             sourceSystem,
             eventType,
             observed,
             expected,
-            explanation);
+            explanation,
+            usedLlm);
+
+        await anomalyRepository.AddAsync(alert, cancellationToken);
 
         try
         {
@@ -179,6 +186,17 @@ public sealed class AnomalyDetectionWorker(
         {
             logger.LogDebug(ex, "Anomaly broadcast failed.");
         }
+    }
+
+    private static string CalculateSeverity(double observed, double expected)
+    {
+        if (expected <= 0)
+        {
+            return observed >= 5 ? "critical" : "high";
+        }
+
+        var ratio = observed / expected;
+        return ratio >= 5 ? "critical" : ratio >= 3 ? "high" : "warning";
     }
 }
 

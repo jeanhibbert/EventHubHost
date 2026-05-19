@@ -1,6 +1,6 @@
 # EventHubHost — improvements over the baseline
 
-The baseline implementation (see [README.md](../README.md) and [docs/architecture.md](architecture.md)) ships a working SQL-grounded RAG pipeline: events are persisted to SQL Server, embedded with `nomic-embed-text`, indexed in Qdrant, and an Ollama `llama3.2:3b` model is asked a question with a grounded-answer guard. That works, but it has the well-known flaws of any small-model RAG demo:
+The baseline implementation (see [README.md](../README.md) and [docs/architecture.md](architecture.md)) ships a working SQL-grounded RAG pipeline: events are persisted to SQL Server, embedded with `nomic-embed-text`, indexed in Qdrant, and an Ollama `llama3.1:8b` model is asked a question with a grounded-answer guard. That works, but it has the well-known flaws of any local-model RAG demo:
 
 - The user waits 20–60 s with no feedback before any answer appears.
 - Pure semantic retrieval drags in irrelevant events when the question explicitly mentions a system or event type.
@@ -16,7 +16,7 @@ This document describes the seven improvements implemented on top of the baselin
 
 ## 1. Streaming LLM answers via SignalR
 
-**Problem.** A single synchronous `POST /correlations/query` blocks until the full LLM response is generated, which on `llama3.2:3b` running on CPU is routinely 20–60 s. The user sees nothing during that time.
+**Problem.** A single synchronous `POST /correlations/query` blocks until the full LLM response is generated, which on `llama3.1:8b` running on CPU can take long enough that the user sees nothing during that time.
 
 **Fix.** A new endpoint `POST /correlations/query/stream` is added that:
 
@@ -105,7 +105,7 @@ Span tags include the model name, prompt length, vector match count, filter cont
 
 ## 7. GPU on Ollama (feature toggle)
 
-**Problem.** Even when running on a GPU host, `llama3.2:3b` is fully CPU-bound because the Aspire `ollama/ollama` container is started without the NVIDIA runtime flags. On a 4-core CPU this is the dominant cause of the 20–60 s Ask latency.
+**Problem.** Even when running on a GPU host, the Ollama model is fully CPU-bound because the Aspire `ollama/ollama` container is started without the NVIDIA runtime flags. On a 4-core CPU this can dominate Ask latency.
 
 **Fix.** A new feature toggle `Llm:UseGpu` is read in `EventHubHost.AppHost/AppHost.cs`. When `true`, the `llm` container is augmented with `.WithContainerRuntimeArgs("--gpus=all")`, which Aspire passes through to `docker run`. When `false` (the default), behaviour is unchanged — safe for laptops and CI machines without the NVIDIA Container Toolkit.
 
